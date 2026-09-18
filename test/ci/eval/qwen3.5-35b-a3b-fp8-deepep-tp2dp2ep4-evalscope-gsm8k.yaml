@@ -1,17 +1,28 @@
-api_version: ci.tokenspeed.io/v1
-name: eval-qwen3.5-35b-a3b-fp8-deepep-tp2dp2ep4-gsm8k
+# 任务标签
+api_version: ci.tokenspeed.io/v1 ## ci任务标签格式的版本
+name: eval-qwen3.5-35b-a3b-fp8-deepep-tp2dp2ep4-gsm8k 
 type: eval
 workflow_stage: model-test
+
+# 触发条件
 triggers:
   - per-commit
   - manual
+
+# 测试机器
 runner:
   labels:
     - b200-4gpu
+
+# 环境变量（标注需要安装ci环境依赖）
 env:
   CI: "true"
+
+# 安装tokenspeed环境
 install:
-  - bash test/ci_system/install_deps.sh
+  - bash test/ci_system/install_deps.sh ## 实际执行的安装脚本
+
+# 启动模型服务的配置参数
 server:
   command: >-
     ts serve
@@ -21,7 +32,7 @@ server:
     --dense-tp-size 4
     --moe-tp-size 1
     --ep-size 4
-    --dist-init-addr 127.0.0.1:4000
+    --dist-init-addr 127.0.0.1:4000 ## 分布式初始化（?）
     --quantization fp8
     --moe-backend deep_gemm
     --all2all-backend deepep
@@ -37,13 +48,19 @@ server:
     --trust-remote-code
     --host 127.0.0.1
     --port 8000
+
+  # 服务启动检查（readiness）
   ready:
     url: http://127.0.0.1:8000/readiness
     timeout: 1800
     interval: 10
+
+# evalscope安装命令
 eval:
   install:
-    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]' ## 先创建隔离环境，再安装evalscope
+
+  # 设置执行gsm8k精度测试的配置
   command: >-
     HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
@@ -56,6 +73,8 @@ eval:
     --eval-batch-size 16
     --stream
     --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":1024,"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}'
+
+# 设置报告输出的配置
 report:
-  github_step_summary: true
-score_threshold: 0.90
+  github_step_summary: true ## 将测试摘要写入github action的step summary
+score_threshold: 0.90 ## 检查要求：精度分数大于0.90
