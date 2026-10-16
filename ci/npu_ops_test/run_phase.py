@@ -61,14 +61,14 @@ def parse_args(argv=None):
 def load_inputs(repo_root):
     root = Path(repo_root).resolve(strict=True)
     scanner = runpy.run_path(
-        str(root / "ci/npu_ops/changes.py"),
+        str(root / "ci/npu_ops_test/changes.py"),
         run_name="npu_phase_scanner",
     )
     reporting = runpy.run_path(
-        str(root / "ci/npu_ops/reporting.py"),
+        str(root / "ci/npu_ops_test/reporting.py"),
         run_name="npu_phase_reporting",
     )
-    manifest_path = root / "ci/npu_ops/manifest.json"
+    manifest_path = root / "ci/npu_ops_test/manifest.json"
     manifest = scanner["load_manifest"](manifest_path)
     manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     plan = reporting["read_expected_plan"](
@@ -193,7 +193,14 @@ def run_operator(root, entry, phase, plan, reporting, output_dir, timeout):
     }
     try:
         directory.mkdir()
-        command = [sys.executable, "-B", "-u", str(root / entry["scripts"][phase])]
+        command = [
+            sys.executable,
+            "-B",
+            "-u",
+            str(root / entry["script"]),
+            "--mode",
+            phase,
+        ]
         captured = capture_test(command, root, log, timeout)
         result.update(exit_code=captured["exit_code"], log_saved=captured["log_saved"])
         timing = plan["timing"] if phase == "performance" else {}

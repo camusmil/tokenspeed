@@ -1,5 +1,5 @@
 {
-  "manifest_sha256": "a381ae5d0c833a1e28cd2e16e208c34b53ebb1ca4a6c47865892370a3e083b34",
+  "manifest_sha256": "c1b0bbe462c128db7c3ad80fd279389811f55eea983a7deb0eaa546e6a71a944",
   "operators": {
     "scatter": {
       "accuracy": [
@@ -1035,9 +1035,7 @@
   },
   "schema_version": 2,
   "source_sha256": {
-    "ci/npu_ops/scatter/accuracy.py": "922c800a773606165b2dfb5114189d4ec7dd8dc92bdbb03a89f79167c9542b88",
-    "ci/npu_ops/scatter/performance.py": "7917fa06f58f033b590be3e307b514d45dc75d7bb143d83c494b3ad15dc6c8db",
-    "ci/npu_ops/virtual_slots_to_local/accuracy.py": "bf02f4ec29fccd7dc38e40b631f3fe8a2d069cbc50fda400566f0204d5e87c31",
-    "ci/npu_ops/virtual_slots_to_local/performance.py": "d1d90ca0c431e255d4bc5f41a98b219a8c20ab498429b90789bc217bd75e1f33"
+    "ci/npu_ops_test/tests/scatter-test.py": "0e6f760f185dbfe5380cfa55fe55828bdef94984e7bd1cb585a201ed9ed3e19a",
+    "ci/npu_ops_test/tests/virtual_slots_to_local-test.py": "5b3065251e71235afa046de3cba8a30ff23a677c904dea0f632b730583cea4ed"
   }
 }

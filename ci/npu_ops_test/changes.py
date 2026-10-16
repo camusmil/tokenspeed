@@ -37,16 +37,16 @@ def load_manifest(path: Path) -> dict:
         not isinstance(manifest, dict)
         or type(manifest.get("schema_version")) is not int
     ):
-        raise ValueError("Expected manifest schema_version=2")
-    if manifest["schema_version"] != 2:
-        raise ValueError("Expected manifest schema_version=2")
+        raise ValueError("Expected manifest schema_version=3")
+    if manifest["schema_version"] != 3:
+        raise ValueError("Expected manifest schema_version=3")
     patterns = manifest.get("watch_paths")
     if not isinstance(patterns, list) or not patterns:
         raise ValueError("watch_paths must be a nonempty list")
     if any(not isinstance(p, str) or not p for p in patterns):
         raise ValueError("watch_paths must contain nonempty strings")
     phases = ("accuracy", "performance")
-    if manifest.get("expected_plans") != "ci/npu_ops/expected-plans.json":
+    if manifest.get("expected_plans") != "ci/npu_ops_test/expected-plans.json":
         raise ValueError("Invalid expected_plans path")
     execution = manifest.get("execution")
     if not isinstance(execution, dict) or execution.get("phases") != list(phases):
@@ -68,14 +68,10 @@ def load_manifest(path: Path) -> dict:
         if name in names:
             raise ValueError(f"Duplicate operator: {name}")
         names.add(name)
-        if "entry" in operator:
-            raise ValueError(f"{name}: legacy entry is not supported")
-        scripts = operator.get("scripts")
-        if not isinstance(scripts, dict) or set(scripts) != set(phases):
-            raise ValueError(f"{name}: scripts must define accuracy and performance")
-        for phase in phases:
-            if scripts[phase] != f"ci/npu_ops/{name}/{phase}.py":
-                raise ValueError(f"{name}: invalid {phase} script path")
+        if "entry" in operator or "scripts" in operator:
+            raise ValueError(f"{name}: legacy entry/scripts are not supported")
+        if operator.get("script") != f"ci/npu_ops_test/tests/{name}-test.py":
+            raise ValueError(f"{name}: invalid script path")
         for field in ("accuracy_cases", "performance_configs"):
             value = operator.get(field)
             if type(value) is not int or value <= 0:

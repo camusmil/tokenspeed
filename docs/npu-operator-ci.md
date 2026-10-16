@@ -14,32 +14,36 @@ The label does not change the order: accuracy always precedes performance.
 The independent `pr-test-npu-arm` concurrency group is keyed by PR or ref. Automatic events cancel older runs in the same group; manual events do not initiate cancellation.
 Unrelated label events use a separate group to avoid canceling an active test run. Test code never runs through `pull_request_target`.
 
-The GitHub-hosted `select` job fetches complete Git history and runs `ci/npu_ops/changes.py`:
+The GitHub-hosted `select` job fetches complete Git history and runs `ci/npu_ops_test/changes.py`:
 
 - Pushes compare the `before` and `after` commits. An all-zero `before` conservatively selects the full suite. With the current main-only trigger, this applies when creating main or invoking the selector independently.
 - PRs require the checkout to be the actual merge commit identified by `GITHUB_SHA`, with parents matching the event's base and head SHAs in that order. Selection compares `merge-base(base, head)..head`, excluding changes introduced only on base. Tests execute the merge SHA, not the head SHA.
 - Manual runs execute the full suite at the selected branch or tag's `GITHUB_SHA`.
 - Invalid SHAs, refs, missing Git objects, or comparison failures fail selection instead of silently skipping tests. Tag pushes and branch deletion do not start operator tests.
 
-Path rules in `ci/npu_ops/manifest.json` cover the NPU package, the shared `tokenspeed-kernel/python/` dependency, dependency configuration, NPU CI scripts, and this workflow.
+Path rules in `ci/npu_ops_test/manifest.json` cover the NPU package, the shared `tokenspeed-kernel/python/` dependency, dependency configuration, NPU CI scripts, and this workflow.
 Documentation changes ending in `.md` or `.rst` are excluded. Matching is case-sensitive and includes additions, modifications, deletions, and both sides of a rename, without a file-count limit.
 Any matching path selects every registered operator. Unrelated changes emit `should_run=false` and `reason=no-watched-changes`.
 The workflow has no top-level path filter, so unrelated changes still produce a selection result.
 NVIDIA/AMD workflows, shared path filters, task pipelines, and cancellation/retry controllers are unchanged.
-NPU implementation and regression tests live under `ci/npu_ops/`; new operators do not require changes to GPU task lists under `test/**`.
+NPU CI implementation and operator tests live under `ci/npu_ops_test/`; new operators do not require changes to GPU task lists under `test/**`.
 
 ## Components and execution order
 
-- `ci/npu_ops/changes.py`: validates the manifest and event identity, then selects relevant changes.
-- `ci/npu_ops/manifest.json`: defines watched paths, operator order, script paths, and expected counts.
-- `ci/npu_ops/expected-plans.json`: records accuracy cases, performance configurations, sampling parameters, and associated hashes.
-- `ci/npu_ops/run_step.sh`: checks ARM/Linux after checkout and prepares the host lock, environment, and caches.
-- `ci/npu_ops/run_phase.py`: executes one phase in order, supervises child processes and timeouts, saves evidence, and returns an exit code.
-- `ci/npu_ops/reporting.py`: validates structured logs and generates JSON reports and English Markdown summaries.
-- `ci/npu_ops/<operator>/accuracy.py` and `performance.py`: implement the operator's numerical checks and performance sampling.
-- `ci/npu_ops/tests/`: contains Git, subprocess, bootstrap, and report regressions that do not require an NPU.
+- `ci/npu_ops_test/changes.py`: validates the manifest and event identity, then selects relevant changes.
+- `ci/npu_ops_test/manifest.json`: schema version 3; defines watched paths, operator order, one `script` path per operator, and expected counts.
+- `ci/npu_ops_test/expected-plans.json`: retains schema version 2; records accuracy cases, performance configurations, sampling parameters, and associated hashes.
+- `ci/npu_ops_test/run_step.sh`: checks ARM/Linux after checkout and prepares the host lock, environment, and caches.
+- `ci/npu_ops_test/run_phase.py`: executes one phase in order, supervises child processes and timeouts, saves evidence, and returns an exit code.
+- `ci/npu_ops_test/reporting.py`: validates structured logs and generates JSON reports and English Markdown summaries.
+- `ci/npu_ops_test/tests/<operator>-test.py`: combines numerical checks and performance sampling in one script with a required `--mode` argument.
+- `ci/npu_ops_test/operator_cli.py`: parses the explicit mode and runs the selected phase callbacks, stopping on the first failure.
+
+The `tests/` directory contains the registered operator scripts. Each `<operator>-test.py` runs by file path through the manifest or an explicit command and requires an NPU for accuracy and performance modes. The hyphenated names are executable script paths, not Python module import names.
 
 The NPU job has exactly two authored steps: accuracy tests for all operators, followed by performance tests for all operators.
+The executor starts each manifest `script` with `--mode accuracy` or `--mode performance`; it has no operator-name branches.
+The standalone `--mode all` option is a convenience for one operator only. CI does not use it: CI preserves the global ordering of all accuracy tests before any performance test.
 Both steps share the bootstrap through a YAML anchor. Before fetching repository scripts, the accuracy step validates deployment, platform, and event inputs, creates an isolated run/attempt directory, and checks out the requested SHA.
 Only then can it invoke the repository entry point.
 The performance step reuses the directory only after accuracy succeeds. Both steps require Linux, `uname -m` equal to `aarch64` or `arm64`, the expected SHA, and a checkout without modified or untracked files.
@@ -103,7 +107,10 @@ Run directories are retained for verification; operators must arrange cleanup. D
 ## Adding cases, operators, and structured events
 
 To add a case, update its script and test plan, then synchronize parameters, ordering, counts, and script hashes in `expected-plans.json`.
-To add an operator, create `ci/npu_ops/<name>/accuracy.py` and `performance.py`, register its name, canonical script paths, and counts in the manifest's `operators` list, and add its accuracy plan, performance plan, and timing parameters to the expected plan.
+To add an operator, create `ci/npu_ops_test/tests/<name>-test.py`, register its name, a single `script` field pointing to that canonical path, and counts in the manifest's `operators` list, and add its accuracy plan, performance plan, and timing parameters to the expected plan.
+Each script must accept the required `--mode {accuracy,performance,all}` argument. Parse arguments before importing NPU dependencies so `--help`, missing arguments, and invalid values work on a CPU host.
+Use the shared CLI with two callbacks returning integer exit codes; `all` calls accuracy first and starts performance only after accuracy returns zero. Exceptions, nonzero exits, and invalid callback results stop execution. Do not store the active mode in mutable global state.
+Schema version 3 rejects the former per-phase `scripts` mapping. The expected plan keeps its existing case/configuration data and schema version 2, with one `source_sha256` entry for each registered script.
 Update `watch_paths` for new source dependencies. Do not add operator-name branches to the common executor or additional workflow steps.
 
 Each structured event occupies one line: `NPU_RESULT_JSON=<JSON object>`. Use `allow_nan=False` and flush output promptly.
@@ -122,27 +129,41 @@ Hashes bind the plan to specific files; they do not replace review of expected v
 python3 - <<'PY'
 import hashlib, json
 from pathlib import Path
-root = Path('ci/npu_ops')
+root = Path('ci/npu_ops_test')
 manifest = json.loads((root / 'manifest.json').read_text())
 plan_path = root / 'expected-plans.json'
 plan = json.loads(plan_path.read_text())
 plan['manifest_sha256'] = hashlib.sha256((root / 'manifest.json').read_bytes()).hexdigest()
 plan['source_sha256'] = {
-    path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
-    for entry in manifest['operators'] for path in entry['scripts'].values()
+    entry['script']: hashlib.sha256(Path(entry['script']).read_bytes()).hexdigest()
+    for entry in manifest['operators']
 }
 plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False) + '\n')
 PY
-python3 -B -m unittest discover -s ci/npu_ops/tests -v
 ```
 
-These tests use temporary Git repositories, real subprocesses, the workflow bootstrap, and structured logs without requiring NPU hardware. They do not establish numerical correctness on an NPU.
-Before committing, run the complete `pre-commit run --all-files` in the target environment, recheck hashes and regressions, and sign off the commit.
-After loading the environment on an ARM runner, a phase can also be invoked directly with the same interpreter:
+Before committing, run the complete `pre-commit run --all-files` in the target environment, recheck the plan hashes, and sign off the commit. Validate operator changes through the ARM NPU workflow.
+After loading the environment on an ARM runner, each operator has three standalone modes. For example, from the repository root:
+
+```bash
+export PYTHONPATH="$PWD/tokenspeed-kernel/python:$PWD/tokenspeed-kernel-npu/python${PYTHONPATH:+:$PYTHONPATH}"
+/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B -u \
+  ci/npu_ops_test/tests/scatter-test.py --mode accuracy
+/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B -u \
+  ci/npu_ops_test/tests/scatter-test.py --mode performance
+/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B -u \
+  ci/npu_ops_test/tests/scatter-test.py --mode all
+```
+
+Use `tests/virtual_slots_to_local-test.py` in place of `tests/scatter-test.py` for the other operator. There is no default mode.
+`all` performs accuracy and then performance for that operator, preserving distinct `phase=accuracy` and `phase=performance` structured events. Any accuracy failure prevents performance from starting.
+Standalone scripts print results but do not acquire the workflow host lock or save phase reports. They are not a replacement for the CI entry point.
+
+To invoke the common phase executor directly with a new output directory:
 
 ```bash
 /srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B -u \
-  ci/npu_ops/run_phase.py --repo-root "$PWD" --phase accuracy \
+  ci/npu_ops_test/run_phase.py --repo-root "$PWD" --phase accuracy \
   --output-dir /tmp/npu-accuracy-unique --timeout-seconds 600
 ```
 

@@ -92,7 +92,7 @@ def read_expected_plan(path, manifest, manifest_sha256, repo_root):
         "Plan operators differ from manifest",
     )
     sources = plan.get("source_sha256")
-    scripts = {relative for item in registered for relative in item["scripts"].values()}
+    scripts = {item["script"] for item in registered}
     require(
         type(sources) is dict and set(sources) == scripts,
         "Plan source list differs from manifest",
