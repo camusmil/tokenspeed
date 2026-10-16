@@ -1,0 +1,47 @@
+{
+  "schema_version": 2,
+  "watch_paths": [
+    "tokenspeed-kernel*/**",
+    "tokenspeed-mla/**",
+    "python/tokenspeed/runtime/**",
+    "ops/**",
+    "kernels/**",
+    "**/ops/**",
+    "**/kernels/**",
+    "ci/npu_ops/**",
+    ".github/workflows/npu-tests.yml",
+    "test/ci_system/*npu*",
+    "test/ci_system/*ascend*"
+  ],
+  "expected_plans": "ci/npu_ops/expected-plans.json",
+  "execution": {
+    "phases": [
+      "accuracy",
+      "performance"
+    ],
+    "fail_fast": true
+  },
+  "performance_policy": {
+    "mode": "record_only"
+  },
+  "operators": [
+    {
+      "name": "scatter",
+      "scripts": {
+        "accuracy": "ci/npu_ops/scatter/accuracy.py",
+        "performance": "ci/npu_ops/scatter/performance.py"
+      },
+      "accuracy_cases": 5,
+      "performance_configs": 6
+    },
+    {
+      "name": "virtual_slots_to_local",
+      "scripts": {
+        "accuracy": "ci/npu_ops/virtual_slots_to_local/accuracy.py",
+        "performance": "ci/npu_ops/virtual_slots_to_local/performance.py"
+      },
+      "accuracy_cases": 48,
+      "performance_configs": 8
+    }
+  ]
+}
