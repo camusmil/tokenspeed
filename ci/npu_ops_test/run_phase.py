@@ -61,14 +61,14 @@ def parse_args(argv=None):
 def load_inputs(repo_root):
     root = Path(repo_root).resolve(strict=True)
     scanner = runpy.run_path(
-        str(root / "ci/npu_ops/changes.py"),
+        str(root / "ci/npu_ops_test/changes.py"),
         run_name="npu_phase_scanner",
     )
     reporting = runpy.run_path(
-        str(root / "ci/npu_ops/reporting.py"),
+        str(root / "ci/npu_ops_test/reporting.py"),
         run_name="npu_phase_reporting",
     )
-    manifest_path = root / "ci/npu_ops/manifest.json"
+    manifest_path = root / "ci/npu_ops_test/manifest.json"
     manifest = scanner["load_manifest"](manifest_path)
     manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     plan = reporting["read_expected_plan"](
@@ -126,7 +126,7 @@ def capture_test(command, repo_root, log_path, timeout_seconds):
                         now = time.monotonic()
                         if now >= next_heartbeat:
                             print(
-                                f"测试仍在执行：耗时={now-started:.1f}s，日志={path}",
+                                f"Test is still running: elapsed={now-started:.1f}s, log={path}",
                                 flush=True,
                             )
                             next_heartbeat = now + 30
@@ -193,7 +193,14 @@ def run_operator(root, entry, phase, plan, reporting, output_dir, timeout):
     }
     try:
         directory.mkdir()
-        command = [sys.executable, "-B", "-u", str(root / entry["scripts"][phase])]
+        command = [
+            sys.executable,
+            "-B",
+            "-u",
+            str(root / entry["script"]),
+            "--mode",
+            phase,
+        ]
         captured = capture_test(command, root, log, timeout)
         result.update(exit_code=captured["exit_code"], log_saved=captured["log_saved"])
         timing = plan["timing"] if phase == "performance" else {}
@@ -256,7 +263,7 @@ def execute_phase(
     for entry in manifest["operators"]:
         name = entry["name"]
         started = time.monotonic()
-        print(f"开始执行：{name}/{phase}", flush=True)
+        print(f"Execution started: {name}/{phase}", flush=True)
         if actions:
             print(f"::group::{name}/{phase}", flush=True)
         try:
@@ -273,22 +280,24 @@ def execute_phase(
             if actions:
                 print("::endgroup::", flush=True)
         print(
-            f"执行结束：{name}/{phase}，exit={result['exit_code']}，"
-            f"耗时={time.monotonic()-started:.2f}s，status={result['status']}",
+            f"Execution finished: {name}/{phase}, exit={result['exit_code']}, "
+            f"elapsed={time.monotonic()-started:.2f}s, status={result['status']}",
             flush=True,
         )
         results.append(result)
         if not reporting["phase_succeeded"](result, phase):
             detail = result.get("error") or f"process exit={result['exit_code']}"
             report_error(f"{name}/{phase}: {detail}")
-            print(f"{name}/{phase} 失败，停止后续算子。", flush=True)
+            print(
+                f"{name}/{phase} failed; remaining operators will not run.", flush=True
+            )
             break
     metadata["finished_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     report = reporting["make_report"](results, metadata, manifest, phase)
     print(reporting["render_summary"](report), flush=True)
     saved = reporting["save_report"](report, output, github_summary)
-    print("结构化报告：", saved["json"]["path"], flush=True)
-    print("中文摘要：", saved["markdown"]["path"], flush=True)
+    print("Structured report:", saved["json"]["path"], flush=True)
+    print("Markdown summary:", saved["markdown"]["path"], flush=True)
     return report["exit_code"]
 
 
@@ -305,7 +314,7 @@ def save_failure_summary(path, phase, message):
         import html
 
         text = (
-            f"\n### ARM NPU 阶段执行失败\n\n阶段：`{phase}`；后续测试已停止。\n\n"
+            f"\n### ARM NPU phase execution failed\n\nPhase: `{phase}`. Remaining tests have been stopped.\n\n"
             f"<pre>{html.escape(message)}</pre>\n"
         )
         with Path(path).open("a", encoding="utf-8") as handle:
@@ -347,9 +356,9 @@ def main(argv=None):
         os.environ["PYTHONPATH"] = pythonpath
         if os.environ.get("GITHUB_ACTIONS") == "true" and args.github_summary is None:
             raise RuntimeError("GITHUB_STEP_SUMMARY is required inside Actions")
-        print("执行阶段：", args.phase, flush=True)
-        print("Python：", sys.executable, flush=True)
-        print("源码目录：", root, flush=True)
+        print("Phase:", args.phase, flush=True)
+        print("Python:", sys.executable, flush=True)
+        print("Source directory:", root, flush=True)
         return execute_phase(
             root,
             manifest,
@@ -361,21 +370,21 @@ def main(argv=None):
             args.github_summary,
         )
     except PhaseInterrupted as exc:
-        message = f"阶段已中断：signal={exc.signum}，停止后续测试。"
+        message = f"Phase interrupted: signal={exc.signum}; remaining tests have been stopped."
         report_error(message)
         try:
             save_failure_summary(args.github_summary, args.phase, message)
         except Exception as summary_error:
-            report_error(f"摘要保存失败：{summary_error}")
+            report_error(f"Failed to save summary: {summary_error}")
         return 128 + exc.signum
     except Exception as exc:
-        message = f"阶段执行失败：{type(exc).__name__}: {exc}"
+        message = f"Phase execution failed: {type(exc).__name__}: {exc}"
         traceback.print_exc()
         report_error(message)
         try:
             save_failure_summary(args.github_summary, args.phase, message)
         except Exception as summary_error:
-            report_error(f"摘要保存失败：{summary_error}")
+            report_error(f"Failed to save summary: {summary_error}")
         return 1
     finally:
         if previous_pythonpath is None:
