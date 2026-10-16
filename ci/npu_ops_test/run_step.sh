@@ -29,11 +29,6 @@ check_platform() {
   esac
 }
 
-# This explicit interface allows CPU-only checks of the deployment contract.
-if [[ "${1:-}" = --check-platform && "$#" = 3 ]]; then
-  check_platform "$2" "$3"
-  exit
-fi
 [[ "$#" = 2 ]]
 phase=$1
 work=$2

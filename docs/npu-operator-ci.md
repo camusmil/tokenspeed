@@ -26,7 +26,7 @@ Documentation changes ending in `.md` or `.rst` are excluded. Matching is case-s
 Any matching path selects every registered operator. Unrelated changes emit `should_run=false` and `reason=no-watched-changes`.
 The workflow has no top-level path filter, so unrelated changes still produce a selection result.
 NVIDIA/AMD workflows, shared path filters, task pipelines, and cancellation/retry controllers are unchanged.
-NPU implementation and regression tests live under `ci/npu_ops_test/`; new operators do not require changes to GPU task lists under `test/**`.
+NPU CI implementation and operator tests live under `ci/npu_ops_test/`; new operators do not require changes to GPU task lists under `test/**`.
 
 ## Components and execution order
 
@@ -38,9 +38,8 @@ NPU implementation and regression tests live under `ci/npu_ops_test/`; new opera
 - `ci/npu_ops_test/reporting.py`: validates structured logs and generates JSON reports and English Markdown summaries.
 - `ci/npu_ops_test/tests/<operator>-test.py`: combines numerical checks and performance sampling in one script with a required `--mode` argument.
 - `ci/npu_ops_test/operator_cli.py`: parses the explicit mode and runs the selected phase callbacks, stopping on the first failure.
-- `ci/npu_ops_test/tests/test_*.py`: contains Git, subprocess, bootstrap, CLI, and report regressions that do not require an NPU.
 
-The shared `tests/` directory contains two kinds of tests. CPU regressions use the `test_*.py` naming convention and run through `unittest` discovery. Operator scripts use `<operator>-test.py` and run by file path through the manifest or an explicit command; they require an NPU for accuracy and performance modes. The hyphenated names are executable script paths, not Python module import names.
+The `tests/` directory contains the registered operator scripts. Each `<operator>-test.py` runs by file path through the manifest or an explicit command and requires an NPU for accuracy and performance modes. The hyphenated names are executable script paths, not Python module import names.
 
 The NPU job has exactly two authored steps: accuracy tests for all operators, followed by performance tests for all operators.
 The executor starts each manifest `script` with `--mode accuracy` or `--mode performance`; it has no operator-name branches.
@@ -141,11 +140,9 @@ plan['source_sha256'] = {
 }
 plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False) + '\n')
 PY
-python3 -B -m unittest discover -s ci/npu_ops_test/tests -p 'test_*.py' -v
 ```
 
-These tests use temporary Git repositories, real subprocesses, the workflow bootstrap, and structured logs without requiring NPU hardware. They do not establish numerical correctness on an NPU.
-Before committing, run the complete `pre-commit run --all-files` in the target environment, recheck hashes and regressions, and sign off the commit.
+Before committing, run the complete `pre-commit run --all-files` in the target environment, recheck the plan hashes, and sign off the commit. Validate operator changes through the ARM NPU workflow.
 After loading the environment on an ARM runner, each operator has three standalone modes. For example, from the repository root:
 
 ```bash
