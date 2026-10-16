@@ -24,13 +24,13 @@
       "name": "scatter",
       "accuracy_cases": 5,
       "performance_configs": 6,
-      "script": "ci/npu_ops_test/scatter/test.py"
+      "script": "ci/npu_ops_test/tests/scatter-test.py"
     },
     {
       "name": "virtual_slots_to_local",
       "accuracy_cases": 48,
       "performance_configs": 8,
-      "script": "ci/npu_ops_test/virtual_slots_to_local/test.py"
+      "script": "ci/npu_ops_test/tests/virtual_slots_to_local-test.py"
     }
   ]
 }

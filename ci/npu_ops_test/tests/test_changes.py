@@ -147,7 +147,7 @@ class ChangeSelectionTests(unittest.TestCase):
 
     def test_ci_infrastructure_changes(self):
         for path in (
-            "ci/npu_ops_test/scatter/test.py",
+            "ci/npu_ops_test/tests/scatter-test.py",
             ".github/workflows/pr-test-ascendnpu-arm.yml",
             "ci/npu_ops_test/tests/test_changes.py",
             "test/ci_system/install_triton_ascend.sh",

@@ -36,9 +36,11 @@ NPU implementation and regression tests live under `ci/npu_ops_test/`; new opera
 - `ci/npu_ops_test/run_step.sh`: checks ARM/Linux after checkout and prepares the host lock, environment, and caches.
 - `ci/npu_ops_test/run_phase.py`: executes one phase in order, supervises child processes and timeouts, saves evidence, and returns an exit code.
 - `ci/npu_ops_test/reporting.py`: validates structured logs and generates JSON reports and English Markdown summaries.
-- `ci/npu_ops_test/<operator>/test.py`: combines numerical checks and performance sampling in one script with a required `--mode` argument.
+- `ci/npu_ops_test/tests/<operator>-test.py`: combines numerical checks and performance sampling in one script with a required `--mode` argument.
 - `ci/npu_ops_test/operator_cli.py`: parses the explicit mode and runs the selected phase callbacks, stopping on the first failure.
-- `ci/npu_ops_test/tests/`: contains Git, subprocess, bootstrap, and report regressions that do not require an NPU.
+- `ci/npu_ops_test/tests/test_*.py`: contains Git, subprocess, bootstrap, CLI, and report regressions that do not require an NPU.
+
+The shared `tests/` directory contains two kinds of tests. CPU regressions use the `test_*.py` naming convention and run through `unittest` discovery. Operator scripts use `<operator>-test.py` and run by file path through the manifest or an explicit command; they require an NPU for accuracy and performance modes. The hyphenated names are executable script paths, not Python module import names.
 
 The NPU job has exactly two authored steps: accuracy tests for all operators, followed by performance tests for all operators.
 The executor starts each manifest `script` with `--mode accuracy` or `--mode performance`; it has no operator-name branches.
@@ -106,7 +108,7 @@ Run directories are retained for verification; operators must arrange cleanup. D
 ## Adding cases, operators, and structured events
 
 To add a case, update its script and test plan, then synchronize parameters, ordering, counts, and script hashes in `expected-plans.json`.
-To add an operator, create `ci/npu_ops_test/<name>/test.py`, register its name, a single `script` field pointing to that canonical path, and counts in the manifest's `operators` list, and add its accuracy plan, performance plan, and timing parameters to the expected plan.
+To add an operator, create `ci/npu_ops_test/tests/<name>-test.py`, register its name, a single `script` field pointing to that canonical path, and counts in the manifest's `operators` list, and add its accuracy plan, performance plan, and timing parameters to the expected plan.
 Each script must accept the required `--mode {accuracy,performance,all}` argument. Parse arguments before importing NPU dependencies so `--help`, missing arguments, and invalid values work on a CPU host.
 Use the shared CLI with two callbacks returning integer exit codes; `all` calls accuracy first and starts performance only after accuracy returns zero. Exceptions, nonzero exits, and invalid callback results stop execution. Do not store the active mode in mutable global state.
 Schema version 3 rejects the former per-phase `scripts` mapping. The expected plan keeps its existing case/configuration data and schema version 2, with one `source_sha256` entry for each registered script.
@@ -139,7 +141,7 @@ plan['source_sha256'] = {
 }
 plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False) + '\n')
 PY
-python3 -B -m unittest discover -s ci/npu_ops_test/tests -v
+python3 -B -m unittest discover -s ci/npu_ops_test/tests -p 'test_*.py' -v
 ```
 
 These tests use temporary Git repositories, real subprocesses, the workflow bootstrap, and structured logs without requiring NPU hardware. They do not establish numerical correctness on an NPU.
@@ -149,14 +151,14 @@ After loading the environment on an ARM runner, each operator has three standalo
 ```bash
 export PYTHONPATH="$PWD/tokenspeed-kernel/python:$PWD/tokenspeed-kernel-npu/python${PYTHONPATH:+:$PYTHONPATH}"
 /srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B -u \
-  ci/npu_ops_test/scatter/test.py --mode accuracy
+  ci/npu_ops_test/tests/scatter-test.py --mode accuracy
 /srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B -u \
-  ci/npu_ops_test/scatter/test.py --mode performance
+  ci/npu_ops_test/tests/scatter-test.py --mode performance
 /srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B -u \
-  ci/npu_ops_test/scatter/test.py --mode all
+  ci/npu_ops_test/tests/scatter-test.py --mode all
 ```
 
-Use `virtual_slots_to_local/test.py` in place of `scatter/test.py` for the other operator. There is no default mode.
+Use `tests/virtual_slots_to_local-test.py` in place of `tests/scatter-test.py` for the other operator. There is no default mode.
 `all` performs accuracy and then performance for that operator, preserving distinct `phase=accuracy` and `phase=performance` structured events. Any accuracy failure prevents performance from starting.
 Standalone scripts print results but do not acquire the workflow host lock or save phase reports. They are not a replacement for the CI entry point.
 

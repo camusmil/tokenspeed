@@ -62,7 +62,7 @@ class PhaseTests(unittest.TestCase):
         self.manifest["operators"] = []
         self.plan = {"schema_version": 2, "operators": {}, "source_sha256": {}}
         for name in ("alpha", "beta"):
-            script_path = f"ci/npu_ops_test/{name}/test.py"
+            script_path = f"ci/npu_ops_test/tests/{name}-test.py"
             self.manifest["operators"].append(
                 dict(
                     name=name,
@@ -153,7 +153,7 @@ class PhaseTests(unittest.TestCase):
         )
 
     def append(self, phase, code):
-        path = self.root / "ci/npu_ops_test/alpha/test.py"
+        path = self.root / "ci/npu_ops_test/tests/alpha-test.py"
         path.write_text(
             path.read_text()
             + f"if phase == {phase!r}:\n"
@@ -271,7 +271,7 @@ class PhaseTests(unittest.TestCase):
         self.assertIn("Failed to save summary", result.stdout)
 
     def test_hash_failure_prevents_tests_and_emits_escaped_annotation(self):
-        path = self.root / "ci/npu_ops_test/alpha/test.py"
+        path = self.root / "ci/npu_ops_test/tests/alpha-test.py"
         path.write_text("raise AssertionError('must not run')\n")
         result = self.run_phase("accuracy", self.root / "summary.md")
         self.assertNotEqual(result.returncode, 0)
@@ -279,7 +279,7 @@ class PhaseTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
 
     def test_failure_annotation_escapes_original_error(self):
-        script = self.root / "ci/npu_ops_test/alpha/test.py"
+        script = self.root / "ci/npu_ops_test/tests/alpha-test.py"
         records = self.records("alpha", "accuracy")[:2]
         records.append(
             dict(
@@ -318,7 +318,7 @@ class PhaseTests(unittest.TestCase):
         )
 
     def test_missing_sample_rejected(self):
-        path = self.root / "ci/npu_ops_test/alpha/test.py"
+        path = self.root / "ci/npu_ops_test/tests/alpha-test.py"
         path.write_text(
             "\n".join(
                 line

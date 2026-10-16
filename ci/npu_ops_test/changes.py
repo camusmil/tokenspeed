@@ -70,7 +70,7 @@ def load_manifest(path: Path) -> dict:
         names.add(name)
         if "entry" in operator or "scripts" in operator:
             raise ValueError(f"{name}: legacy entry/scripts are not supported")
-        if operator.get("script") != f"ci/npu_ops_test/{name}/test.py":
+        if operator.get("script") != f"ci/npu_ops_test/tests/{name}-test.py":
             raise ValueError(f"{name}: invalid script path")
         for field in ("accuracy_cases", "performance_configs"):
             value = operator.get(field)
