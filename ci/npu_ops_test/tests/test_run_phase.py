@@ -50,25 +50,25 @@ class PhaseTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.output = self.root / "results"
-        target = self.root / "ci/npu_ops"
+        target = self.root / "ci/npu_ops_test"
         target.mkdir(parents=True)
         for name in ("changes.py", "reporting.py", "run_phase.py"):
-            shutil.copyfile(self.source / "ci/npu_ops" / name, target / name)
+            shutil.copyfile(self.source / "ci/npu_ops_test" / name, target / name)
         for name in ("tokenspeed-kernel/python", "tokenspeed-kernel-npu/python"):
             (self.root / name).mkdir(parents=True)
         self.manifest = json.loads(
-            (self.source / "ci/npu_ops/manifest.json").read_text()
+            (self.source / "ci/npu_ops_test/manifest.json").read_text()
         )
         self.manifest["operators"] = []
         self.plan = {"schema_version": 2, "operators": {}, "source_sha256": {}}
         for name in ("alpha", "beta"):
-            scripts = {
-                phase: f"ci/npu_ops/{name}/{phase}.py"
-                for phase in ("accuracy", "performance")
-            }
+            script_path = f"ci/npu_ops_test/{name}/test.py"
             self.manifest["operators"].append(
                 dict(
-                    name=name, scripts=scripts, accuracy_cases=1, performance_configs=1
+                    name=name,
+                    script=script_path,
+                    accuracy_cases=1,
+                    performance_configs=1,
                 )
             )
             self.plan["operators"][name] = {
@@ -80,20 +80,22 @@ class PhaseTests(unittest.TestCase):
                 ],
                 "timing": {"warmup": 0, "iterations": 1, "sample_count": 1},
             }
-            for phase, path in scripts.items():
-                records = self.records(name, phase)
-                script = self.root / path
-                script.parent.mkdir(exist_ok=True)
-                script.write_text(
-                    "import json\n"
-                    + "\n".join(
-                        "print('NPU_RESULT_JSON=' + json.dumps("
-                        + repr(r)
-                        + "), flush=True)"
-                        for r in records
+            script = self.root / script_path
+            script.parent.mkdir(exist_ok=True)
+            code = (
+                "import argparse, json\nparser = argparse.ArgumentParser()\n"
+                "parser.add_argument('--mode', choices=('accuracy', 'performance'), required=True)\n"
+                "phase = parser.parse_args().mode\n"
+            )
+            for phase in ("accuracy", "performance"):
+                code += f"if phase == {phase!r}:\n"
+                for record in self.records(name, phase):
+                    code += (
+                        "    print('NPU_RESULT_JSON=' + json.dumps("
+                        + repr(record)
+                        + "), flush=True)\n"
                     )
-                    + "\n"
-                )
+            script.write_text(code)
         self.sync_plan()
 
     def records(self, name, phase):
@@ -138,19 +140,26 @@ class PhaseTests(unittest.TestCase):
         ]
 
     def sync_plan(self):
-        path = self.root / "ci/npu_ops/manifest.json"
+        path = self.root / "ci/npu_ops_test/manifest.json"
         path.write_text(json.dumps(self.manifest))
         self.plan["manifest_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
         for entry in self.manifest["operators"]:
-            for path in entry["scripts"].values():
-                self.plan["source_sha256"][path] = hashlib.sha256(
-                    (self.root / path).read_bytes()
-                ).hexdigest()
-        (self.root / "ci/npu_ops/expected-plans.json").write_text(json.dumps(self.plan))
+            path = entry["script"]
+            self.plan["source_sha256"][path] = hashlib.sha256(
+                (self.root / path).read_bytes()
+            ).hexdigest()
+        (self.root / "ci/npu_ops_test/expected-plans.json").write_text(
+            json.dumps(self.plan)
+        )
 
     def append(self, phase, code):
-        path = self.root / f"ci/npu_ops/alpha/{phase}.py"
-        path.write_text(path.read_text() + code + "\n")
+        path = self.root / "ci/npu_ops_test/alpha/test.py"
+        path.write_text(
+            path.read_text()
+            + f"if phase == {phase!r}:\n"
+            + "\n".join("    " + line for line in code.splitlines())
+            + "\n"
+        )
         self.sync_plan()
 
     def run_phase(self, phase, summary):
@@ -160,7 +169,7 @@ class PhaseTests(unittest.TestCase):
                 sys.executable,
                 "-B",
                 "-u",
-                str(self.root / "ci/npu_ops/run_phase.py"),
+                str(self.root / "ci/npu_ops_test/run_phase.py"),
                 "--repo-root",
                 str(self.root),
                 "--phase",
@@ -186,9 +195,26 @@ class PhaseTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout)
             report = json.loads((self.output / "report.json").read_text())
             self.assertEqual(report["status"], "passed")
-            self.assertIn("执行结束", result.stdout)
+            self.assertIn("Execution finished", result.stdout)
+            summary = (self.output / "summary.md").read_text()
+            self.assertIn(f"## Ascend NPU operator {phase} tests", summary)
+            self.assertIn("Phase status: **passed**", summary)
+            self.assertIn("| Operator | Result | Progress | Exit code |", summary)
+            self.assertIn("### Evidence", summary)
+            self.assertIn("### Run information", summary)
+            self.assertTrue(summary.isascii(), summary)
+            self.assertIn(summary, (self.root / "summary.md").read_text())
             if phase == "performance":
                 self.assertEqual(report["performance_verdict"], "not_evaluated")
+                self.assertIn("Performance verdict: **not_evaluated**", summary)
+                self.assertIn("no latency thresholds are configured", summary)
+                self.assertIn("### Configuration sampling results", summary)
+                self.assertIn("Median latency (ms/execution)", summary)
+            else:
+                self.assertIn(
+                    "Completed 1/1; passed 1; failed 0; incomplete 0; not run 0",
+                    summary,
+                )
 
     def test_nonzero_exit_stops_later_operator_in_both_phases(self):
         for phase in ("accuracy", "performance"):
@@ -201,6 +227,10 @@ class PhaseTests(unittest.TestCase):
             self.assertEqual(report["operators"][1]["status"], "not_run")
             self.assertFalse((self.output / "beta").exists())
             self.assertIn("::error::", result.stdout)
+            summary = (self.output / "summary.md").read_text()
+            self.assertIn("Phase status: **failed**", summary)
+            self.assertIn("### Failure and execution details", summary)
+            self.assertIn("beta: not run after failure of alpha", summary)
 
     def test_timeout_stops_later_operator(self):
         self.append("accuracy", "import time; time.sleep(60)")
@@ -229,16 +259,19 @@ class PhaseTests(unittest.TestCase):
         result = self.run_phase("accuracy", self.root / "summary.md")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("report.json", result.stdout)
-        self.assertIn("阶段执行失败", result.stdout)
-        self.assertIn("阶段执行失败", (self.root / "summary.md").read_text())
+        self.assertIn("Phase execution failed", result.stdout)
+        summary = (self.root / "summary.md").read_text()
+        self.assertIn("### ARM NPU phase execution failed", summary)
+        self.assertIn("Phase: `accuracy`. Remaining tests have been stopped.", summary)
+        self.assertIn("Phase execution failed", summary)
 
     def test_actions_summary_failure_propagates(self):
         result = self.run_phase("accuracy", self.root)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("摘要保存失败", result.stdout)
+        self.assertIn("Failed to save summary", result.stdout)
 
     def test_hash_failure_prevents_tests_and_emits_escaped_annotation(self):
-        path = self.root / "ci/npu_ops/alpha/accuracy.py"
+        path = self.root / "ci/npu_ops_test/alpha/test.py"
         path.write_text("raise AssertionError('must not run')\n")
         result = self.run_phase("accuracy", self.root / "summary.md")
         self.assertNotEqual(result.returncode, 0)
@@ -246,7 +279,7 @@ class PhaseTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
 
     def test_failure_annotation_escapes_original_error(self):
-        script = self.root / "ci/npu_ops/alpha/accuracy.py"
+        script = self.root / "ci/npu_ops_test/alpha/test.py"
         records = self.records("alpha", "accuracy")[:2]
         records.append(
             dict(
@@ -260,7 +293,7 @@ class PhaseTests(unittest.TestCase):
                 failed_cases=0,
                 current_case="one",
                 error_type="RuntimeError",
-                error="bad%value\nnext\rline",
+                error="bad%value\nnext\rline \u539f\u59cb\u9519\u8bef",
             )
         )
         script.write_text(
@@ -275,11 +308,17 @@ class PhaseTests(unittest.TestCase):
         result = self.run_phase("accuracy", self.root / "summary.md")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(
-            "::error::alpha/accuracy: bad%25value%0Anext%0Dline", result.stdout
+            "::error::alpha/accuracy: bad%25value%0Anext%0Dline \u539f\u59cb\u9519\u8bef",
+            result.stdout,
+        )
+        report = json.loads((self.output / "report.json").read_text())
+        self.assertEqual(report["operators"][0]["error"], records[-1]["error"])
+        self.assertIn(
+            "\u539f\u59cb\u9519\u8bef", (self.output / "summary.md").read_text()
         )
 
     def test_missing_sample_rejected(self):
-        path = self.root / "ci/npu_ops/alpha/performance.py"
+        path = self.root / "ci/npu_ops_test/alpha/test.py"
         path.write_text(
             "\n".join(
                 line
@@ -327,7 +366,7 @@ class PhaseTests(unittest.TestCase):
             result = subprocess.run(
                 [
                     "bash",
-                    str(self.source / "ci/npu_ops/run_step.sh"),
+                    str(self.source / "ci/npu_ops_test/run_step.sh"),
                     "--check-platform",
                     system,
                     architecture,

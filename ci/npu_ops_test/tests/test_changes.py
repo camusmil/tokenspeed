@@ -39,7 +39,7 @@ class ChangeSelectionTests(unittest.TestCase):
         self.temp = None
         self.repo = None
         self.source = Path(__file__).resolve().parents[3]
-        self.manifest_path = self.source / "ci/npu_ops/manifest.json"
+        self.manifest_path = self.source / "ci/npu_ops_test/manifest.json"
         self.manifest = {}
         self.base = ""
 
@@ -139,7 +139,7 @@ class ChangeSelectionTests(unittest.TestCase):
         self.assertEqual(result["changed_files"], 3101)
 
     def test_paths_with_whitespace_and_unicode(self):
-        path = "tokenspeed-kernel-npu/a space\n中文.py"
+        path = "tokenspeed-kernel-npu/a space\n\u4e2d\u6587.py"
         self.write(path, "test\n")
         result = self.scan(self.base, self.commit())
         self.assert_suite_selected(result)
@@ -147,15 +147,18 @@ class ChangeSelectionTests(unittest.TestCase):
 
     def test_ci_infrastructure_changes(self):
         for path in (
-            "ci/npu_ops/scatter/accuracy.py",
-            ".github/workflows/npu-arm-tests.yml",
-            "ci/npu_ops/tests/test_changes.py",
+            "ci/npu_ops_test/scatter/test.py",
+            ".github/workflows/pr-test-ascendnpu-arm.yml",
+            "ci/npu_ops_test/tests/test_changes.py",
             "test/ci_system/install_triton_ascend.sh",
         ):
             with self.subTest(path=path):
                 before = self.git("rev-parse", "HEAD")
                 self.write(path, "test\n")
-                self.assert_suite_selected(self.scan(before, self.commit()))
+                result = self.scan(before, self.commit())
+                self.assert_suite_selected(result)
+                self.assertEqual(result["reason"], "watched-path-changed")
+                self.assertEqual(result["matched_paths_sample"], [path])
 
     def test_missing_git_object_fails(self):
         with self.assertRaises(subprocess.CalledProcessError):
@@ -209,7 +212,7 @@ class ChangeSelectionTests(unittest.TestCase):
 
     def test_docs_and_other_backends_skip(self):
         for path in (
-            "ci/npu_ops/README.md",
+            "ci/npu_ops_test/README.md",
             "tokenspeed-kernel-npu/README.md",
             "tokenspeed-kernel-amd/python/a.py",
             "docs/npu-operator-ci.md",
@@ -293,10 +296,26 @@ class ChangeSelectionTests(unittest.TestCase):
         self.assertEqual(lines["should_run"], "true")
         self.assertEqual(lines, {"should_run": "true", "reason": "manual"})
 
+    def test_single_script_manifest_rejects_legacy_and_invalid_paths(self):
+        invalid = self.repo / "invalid.json"
+        entry = self.manifest["operators"][0]
+        for replacement in (
+            {**entry, "scripts": {"accuracy": "old.py", "performance": "old.py"}},
+            {key: value for key, value in entry.items() if key != "script"},
+            {**entry, "script": "../outside.py"},
+            {**entry, "script": f"ci/npu_ops_test/{entry['name']}/accuracy.py"},
+        ):
+            invalid.write_text(
+                json.dumps({**self.manifest, "operators": [replacement]})
+            )
+            with self.assertRaises(ValueError):
+                load_manifest(invalid)
+
     def test_invalid_manifest_fails(self):
         invalid = self.repo / "invalid.json"
         for changes in (
             {"schema_version": 1},
+            {"schema_version": 2},
             {"watch_paths": []},
             {"operators": []},
             {"operators": self.manifest["operators"] * 2},
