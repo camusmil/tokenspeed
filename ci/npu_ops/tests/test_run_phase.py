@@ -186,9 +186,26 @@ class PhaseTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout)
             report = json.loads((self.output / "report.json").read_text())
             self.assertEqual(report["status"], "passed")
-            self.assertIn("执行结束", result.stdout)
+            self.assertIn("Execution finished", result.stdout)
+            summary = (self.output / "summary.md").read_text()
+            self.assertIn(f"## Ascend NPU operator {phase} tests", summary)
+            self.assertIn("Phase status: **passed**", summary)
+            self.assertIn("| Operator | Result | Progress | Exit code |", summary)
+            self.assertIn("### Evidence", summary)
+            self.assertIn("### Run information", summary)
+            self.assertTrue(summary.isascii(), summary)
+            self.assertIn(summary, (self.root / "summary.md").read_text())
             if phase == "performance":
                 self.assertEqual(report["performance_verdict"], "not_evaluated")
+                self.assertIn("Performance verdict: **not_evaluated**", summary)
+                self.assertIn("no latency thresholds are configured", summary)
+                self.assertIn("### Configuration sampling results", summary)
+                self.assertIn("Median latency (ms/execution)", summary)
+            else:
+                self.assertIn(
+                    "Completed 1/1; passed 1; failed 0; incomplete 0; not run 0",
+                    summary,
+                )
 
     def test_nonzero_exit_stops_later_operator_in_both_phases(self):
         for phase in ("accuracy", "performance"):
@@ -201,6 +218,10 @@ class PhaseTests(unittest.TestCase):
             self.assertEqual(report["operators"][1]["status"], "not_run")
             self.assertFalse((self.output / "beta").exists())
             self.assertIn("::error::", result.stdout)
+            summary = (self.output / "summary.md").read_text()
+            self.assertIn("Phase status: **failed**", summary)
+            self.assertIn("### Failure and execution details", summary)
+            self.assertIn("beta: not run after failure of alpha", summary)
 
     def test_timeout_stops_later_operator(self):
         self.append("accuracy", "import time; time.sleep(60)")
@@ -229,13 +250,16 @@ class PhaseTests(unittest.TestCase):
         result = self.run_phase("accuracy", self.root / "summary.md")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("report.json", result.stdout)
-        self.assertIn("阶段执行失败", result.stdout)
-        self.assertIn("阶段执行失败", (self.root / "summary.md").read_text())
+        self.assertIn("Phase execution failed", result.stdout)
+        summary = (self.root / "summary.md").read_text()
+        self.assertIn("### ARM NPU phase execution failed", summary)
+        self.assertIn("Phase: `accuracy`. Remaining tests have been stopped.", summary)
+        self.assertIn("Phase execution failed", summary)
 
     def test_actions_summary_failure_propagates(self):
         result = self.run_phase("accuracy", self.root)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("摘要保存失败", result.stdout)
+        self.assertIn("Failed to save summary", result.stdout)
 
     def test_hash_failure_prevents_tests_and_emits_escaped_annotation(self):
         path = self.root / "ci/npu_ops/alpha/accuracy.py"
@@ -260,7 +284,7 @@ class PhaseTests(unittest.TestCase):
                 failed_cases=0,
                 current_case="one",
                 error_type="RuntimeError",
-                error="bad%value\nnext\rline",
+                error="bad%value\nnext\rline \u539f\u59cb\u9519\u8bef",
             )
         )
         script.write_text(
@@ -275,7 +299,13 @@ class PhaseTests(unittest.TestCase):
         result = self.run_phase("accuracy", self.root / "summary.md")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(
-            "::error::alpha/accuracy: bad%25value%0Anext%0Dline", result.stdout
+            "::error::alpha/accuracy: bad%25value%0Anext%0Dline \u539f\u59cb\u9519\u8bef",
+            result.stdout,
+        )
+        report = json.loads((self.output / "report.json").read_text())
+        self.assertEqual(report["operators"][0]["error"], records[-1]["error"])
+        self.assertIn(
+            "\u539f\u59cb\u9519\u8bef", (self.output / "summary.md").read_text()
         )
 
     def test_missing_sample_rejected(self):

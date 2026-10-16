@@ -756,36 +756,41 @@ def _md_row(values):
 def render_summary(report):
     phase = report["phase"]
     require(phase in ("accuracy", "performance"), "Unknown summary phase")
-    phase_name = "精度测试" if phase == "accuracy" else "性能测试"
+    phase_name = "accuracy tests" if phase == "accuracy" else "performance tests"
     lines = [
-        f"## NPU 算子{phase_name}",
+        f"## Ascend NPU operator {phase_name}",
         "",
-        "阶段状态：**" + _md_cell(report["status"]) + "**",
+        "Phase status: **" + _md_cell(report["status"]) + "**",
         "",
-        "阶段退出码：" + _md_cell(report["exit_code"]),
+        "Phase exit code: " + _md_cell(report["exit_code"]),
         "",
     ]
     if phase == "performance":
-        lines += ["性能达标状态：**未评估**（尚未配置耗时阈值）。", ""]
+        lines += [
+            "Performance verdict: **not_evaluated** (no latency thresholds are configured).",
+            "",
+        ]
     lines += [
-        "| 算子 | 结果 | 执行进度 | 退出码 | 结构化日志有效 | 日志已保存 |",
+        "| Operator | Result | Progress | Exit code | Structured log valid | Log saved |",
         "| --- | --- | --- | --- | --- | --- |",
     ]
     for item in report["operators"]:
-        progress = "暂无数据"
+        progress = "No data available"
         if item["status"] == "not_run":
-            progress = "因 " + str(item.get("blocked_by", "前序测试")) + " 失败未执行"
+            progress = "Not run after failure of " + str(
+                item.get("blocked_by", "a previous test")
+            )
         elif phase == "accuracy" and "completed_cases" in item:
             progress = (
-                f"已完成 {item['completed_cases']}/{item['expected_cases']}；"
-                f"通过 {item['passed_cases']}；失败 {item['failed_cases']}；"
-                f"未完成 {item['incomplete_cases']}；未执行 {item['not_run_cases']}"
+                f"Completed {item['completed_cases']}/{item['expected_cases']}; "
+                f"passed {item['passed_cases']}; failed {item['failed_cases']}; "
+                f"incomplete {item['incomplete_cases']}; not run {item['not_run_cases']}"
             )
         elif phase == "performance" and "completed_configs" in item:
             progress = (
-                f"已完成配置 {item['completed_configs']}/{item['expected_configs']}；"
-                f"已采集样本 {item['completed_samples']}/{item['expected_samples']}；"
-                f"未完成 {item['incomplete_configs']}；未执行 {item['not_run_configs']}"
+                f"Completed configs {item['completed_configs']}/{item['expected_configs']}; "
+                f"Collected samples {item['completed_samples']}/{item['expected_samples']}; "
+                f"incomplete {item['incomplete_configs']}; not run {item['not_run_configs']}"
             )
         lines.append(
             _md_row(
@@ -802,9 +807,9 @@ def render_summary(report):
     if phase == "performance":
         lines += [
             "",
-            "### 配置采样结果",
+            "### Configuration sampling results",
             "",
-            "| 算子 | 配置 | 结果 | 样本数 | 中位耗时（毫秒/次） |",
+            "| Operator | Configuration | Result | Samples | Median latency (ms/execution) |",
             "| --- | --- | --- | --- | --- |",
         ]
         for item in report["operators"]:
@@ -830,14 +835,16 @@ def render_summary(report):
                 f"{item['operator']}: {item.get('error_type', 'Error')}: {item['error']}"
             )
         elif item["status"] == "not_run":
-            details.append(f"{item['operator']}：因 {item['blocked_by']} 失败未执行")
+            details.append(
+                f"{item['operator']}: not run after failure of {item['blocked_by']}"
+            )
     if details:
-        lines += ["", "### 失败与执行详情", ""]
+        lines += ["", "### Failure and execution details", ""]
         lines += ["- " + _md_cell(reason) for reason in dict.fromkeys(details)]
-    lines += ["", "### 核验记录", "", "| 算子 | 日志路径 |", "| --- | --- |"]
+    lines += ["", "### Evidence", "", "| Operator | Log path |", "| --- | --- |"]
     for item in report["operators"]:
         lines.append(_md_row([item["operator"], item.get("log_path")]))
-    lines += ["", "### 运行信息", "", "| 字段 | 值 |", "| --- | --- |"]
+    lines += ["", "### Run information", "", "| Field | Value |", "| --- | --- |"]
     for key, value in report["metadata"].items():
         lines.append(_md_row([key, value]))
     return "\n".join(lines) + "\n"

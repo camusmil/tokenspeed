@@ -31,7 +31,8 @@ from pathlib import Path
 def bootstrap_script():
     # Execute the actual YAML literal block without adding a YAML dependency.
     workflow = (
-        Path(__file__).resolve().parents[3] / ".github/workflows/npu-arm-tests.yml"
+        Path(__file__).resolve().parents[3]
+        / ".github/workflows/pr-test-ascendnpu-arm.yml"
     )
     lines = iter(workflow.read_text().splitlines())
     for line in lines:
@@ -79,7 +80,12 @@ class BootstrapTests(unittest.TestCase):
                 timeout=10,
             )
             self.assertNotEqual(result.returncode, 0)
-            return result.stdout, summary.read_text()
+            text = summary.read_text()
+            self.assertIn("### ARM NPU phase failed", text)
+            self.assertIn("Phase: `accuracy`; stage:", text)
+            self.assertIn("See the raw logs in this step.", text)
+            self.assertTrue(text.isascii(), text)
+            return result.stdout, text
 
     def test_official_repository_needs_no_fork_allowlist(self):
         output, summary = self.run_bootstrap(
@@ -89,7 +95,7 @@ class BootstrapTests(unittest.TestCase):
             "npu-arm-test",
             "https://github.com",
         )
-        self.assertIn("system 不符合部署契约", output)
+        self.assertIn("system does not match the deployment contract", output)
         self.assertIn("`platform`", summary)
 
     def test_explicit_fork_allowlist_passes_deployment_contract(self):
@@ -100,14 +106,17 @@ class BootstrapTests(unittest.TestCase):
             "npu-arm-test",
             "https://github.com",
         )
-        self.assertIn("system 不符合部署契约", output)
+        self.assertIn("system does not match the deployment contract", output)
         self.assertIn("`platform`", summary)
 
     def test_missing_runner_name_fails_before_platform(self):
         output, summary = self.run_bootstrap(
             "lightseekorg/tokenspeed", "", "", "npu-arm-test", "https://github.com"
         )
-        self.assertIn("必须配置仓库变量 TOKENSPEED_NPU_ARM_RUNNER_NAME", output)
+        self.assertIn(
+            "Repository variable TOKENSPEED_NPU_ARM_RUNNER_NAME must be configured",
+            output,
+        )
         self.assertIn("`deployment-contract`", summary)
 
     def test_wrong_runner_name_fails(self):
@@ -118,7 +127,7 @@ class BootstrapTests(unittest.TestCase):
             "wrong-npu",
             "https://github.com",
         )
-        self.assertIn("runner 不符合部署契约", output)
+        self.assertIn("runner does not match the deployment contract", output)
         self.assertIn("`deployment-contract`", summary)
 
     def test_unlisted_repository_fails(self):
@@ -129,7 +138,7 @@ class BootstrapTests(unittest.TestCase):
             "npu-arm-test",
             "https://github.com",
         )
-        self.assertIn("GITHUB_REPOSITORY 未在仓库白名单中", output)
+        self.assertIn("GITHUB_REPOSITORY is not in the repository allowlist", output)
         self.assertIn("`deployment-contract`", summary)
 
     def test_even_allowlisted_invalid_repository_fails(self):
@@ -143,7 +152,7 @@ class BootstrapTests(unittest.TestCase):
                     "https://github.com",
                 )
                 self.assertIn("GITHUB_REPOSITORY", output)
-                self.assertIn("无效", output)
+                self.assertIn("Invalid", output)
                 self.assertIn("`deployment-contract`", summary)
 
     def test_non_github_server_fails(self):
@@ -154,7 +163,7 @@ class BootstrapTests(unittest.TestCase):
             "npu-arm-test",
             "https://example.invalid",
         )
-        self.assertIn("server 不符合部署契约", output)
+        self.assertIn("server does not match the deployment contract", output)
         self.assertIn("`deployment-contract`", summary)
 
 

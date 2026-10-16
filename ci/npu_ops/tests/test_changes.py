@@ -139,7 +139,7 @@ class ChangeSelectionTests(unittest.TestCase):
         self.assertEqual(result["changed_files"], 3101)
 
     def test_paths_with_whitespace_and_unicode(self):
-        path = "tokenspeed-kernel-npu/a space\n中文.py"
+        path = "tokenspeed-kernel-npu/a space\n\u4e2d\u6587.py"
         self.write(path, "test\n")
         result = self.scan(self.base, self.commit())
         self.assert_suite_selected(result)
@@ -148,14 +148,17 @@ class ChangeSelectionTests(unittest.TestCase):
     def test_ci_infrastructure_changes(self):
         for path in (
             "ci/npu_ops/scatter/accuracy.py",
-            ".github/workflows/npu-arm-tests.yml",
+            ".github/workflows/pr-test-ascendnpu-arm.yml",
             "ci/npu_ops/tests/test_changes.py",
             "test/ci_system/install_triton_ascend.sh",
         ):
             with self.subTest(path=path):
                 before = self.git("rev-parse", "HEAD")
                 self.write(path, "test\n")
-                self.assert_suite_selected(self.scan(before, self.commit()))
+                result = self.scan(before, self.commit())
+                self.assert_suite_selected(result)
+                self.assertEqual(result["reason"], "watched-path-changed")
+                self.assertEqual(result["matched_paths_sample"], [path])
 
     def test_missing_git_object_fails(self):
         with self.assertRaises(subprocess.CalledProcessError):

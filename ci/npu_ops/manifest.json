@@ -5,7 +5,7 @@
     "tokenspeed-kernel/python/**",
     "python/pyproject.toml",
     "ci/npu_ops/**",
-    ".github/workflows/npu-arm-tests.yml",
+    ".github/workflows/pr-test-ascendnpu-arm.yml",
     "test/ci_system/*ascend*"
   ],
   "expected_plans": "ci/npu_ops/expected-plans.json",
