@@ -29,7 +29,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from npu_operator_changes import load_manifest, select_suite
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from changes import load_manifest, select_suite
 
 
 class ChangeSelectionTests(unittest.TestCase):
@@ -37,7 +38,7 @@ class ChangeSelectionTests(unittest.TestCase):
         super().__init__(methodName)
         self.temp = None
         self.repo = None
-        self.source = Path(__file__).resolve().parents[2]
+        self.source = Path(__file__).resolve().parents[3]
         self.manifest_path = self.source / "ci/npu_ops/manifest.json"
         self.manifest = {}
         self.base = ""
@@ -76,6 +77,8 @@ class ChangeSelectionTests(unittest.TestCase):
             self.manifest,
             "push",
             {"ref": "refs/heads/test", "before": before, "after": after},
+            self.git("rev-parse", "HEAD"),
+            "refs/heads/test",
         )
 
     def assert_suite_selected(self, result):
@@ -93,14 +96,8 @@ class ChangeSelectionTests(unittest.TestCase):
     def test_additions_across_operator_roots(self):
         paths = [
             "tokenspeed-kernel-npu/python/a.py",
-            "tokenspeed-kernel-amd/README.md",
             "tokenspeed-kernel/python/a.py",
-            "tokenspeed-mla/test/a.py",
-            "python/tokenspeed/runtime/execution/a.py",
-            "new_package/ops/a.py",
-            "ops/a.py",
-            "kernels/a.py",
-            "new_package/kernels/a.py",
+            "python/pyproject.toml",
         ]
         for path in paths:
             with self.subTest(path=path):
@@ -111,7 +108,7 @@ class ChangeSelectionTests(unittest.TestCase):
                 self.assertEqual(result["matched_paths_sample"], [path])
 
     def test_modify_then_delete_operator_file(self):
-        path = "tokenspeed-kernel-npu/README.md"
+        path = "tokenspeed-kernel-npu/a.py"
         self.write(path, "before\n")
         before = self.commit()
         self.write(path, "after\n")
@@ -151,8 +148,8 @@ class ChangeSelectionTests(unittest.TestCase):
     def test_ci_infrastructure_changes(self):
         for path in (
             "ci/npu_ops/scatter/accuracy.py",
-            ".github/workflows/npu-tests.yml",
-            "test/ci_system/test_npu_operator_changes.py",
+            ".github/workflows/npu-arm-tests.yml",
+            "ci/npu_ops/tests/test_changes.py",
             "test/ci_system/install_triton_ascend.sh",
         ):
             with self.subTest(path=path):
@@ -160,40 +157,114 @@ class ChangeSelectionTests(unittest.TestCase):
                 self.write(path, "test\n")
                 self.assert_suite_selected(self.scan(before, self.commit()))
 
-    def test_missing_git_object_selects_suite(self):
-        result = self.scan("f" * 40, self.base)
-        self.assert_suite_selected(result)
-        self.assertEqual(result["reason"], "git-diff-unavailable")
+    def test_missing_git_object_fails(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.scan("f" * 40, self.base)
 
-    def test_new_branch_or_invalid_comparison_selects_suite(self):
-        for before in ("0" * 40, "invalid", None):
-            result = self.scan(before, self.base)
-            self.assert_suite_selected(result)
-            self.assertEqual(result["reason"], "comparison-unavailable")
+    def test_new_branch_selects_suite(self):
+        result = self.scan("0" * 40, self.base)
+        self.assert_suite_selected(result)
+        self.assertEqual(result["reason"], "new-branch")
+
+    def test_invalid_sha_or_ref_fails(self):
+        for before in ("invalid", None, "--help", "a" * 64):
+            with self.subTest(before=before), self.assertRaises(ValueError):
+                self.scan(before, self.base)
+        for ref in ("--help", "refs/heads/bad..name"):
+            with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                select_suite(
+                    self.repo, self.manifest, "workflow_dispatch", {}, self.base, ref
+                )
 
     def test_manual_selects_suite_without_git_diff(self):
-        result = select_suite(self.repo, self.manifest, "workflow_dispatch", {})
+        result = select_suite(
+            self.repo,
+            self.manifest,
+            "workflow_dispatch",
+            {},
+            self.base,
+            "refs/heads/test",
+        )
         self.assert_suite_selected(result)
         self.assertEqual(result["reason"], "manual")
 
     def test_tag_and_branch_deletion_skip(self):
-        for event in (
-            {"ref": "refs/tags/v1"},
-            {"ref": "refs/heads/test", "deleted": True},
-        ):
-            result = select_suite(self.repo, self.manifest, "push", event)
+        for ref, deleted in (("refs/tags/v1", False), ("refs/heads/test", True)):
+            event = {
+                "ref": ref,
+                "deleted": deleted,
+                "before": self.base,
+                "after": self.base,
+            }
+            result = select_suite(
+                self.repo, self.manifest, "push", event, self.base, ref
+            )
             self.assertFalse(result["should_run"])
-            self.assertNotIn("matrix", result)
 
     def test_missing_ref_is_an_error(self):
         with self.assertRaises(ValueError):
-            select_suite(self.repo, self.manifest, "push", {})
+            select_suite(
+                self.repo, self.manifest, "push", {}, self.base, "refs/heads/test"
+            )
+
+    def test_docs_and_other_backends_skip(self):
+        for path in (
+            "ci/npu_ops/README.md",
+            "tokenspeed-kernel-npu/README.md",
+            "tokenspeed-kernel-amd/python/a.py",
+            "docs/npu-operator-ci.md",
+        ):
+            self.write(path, "documentation or other vendor")
+        self.assertFalse(self.scan(self.base, self.commit())["should_run"])
+
+    def pr_fixture(self, path):
+        self.git("checkout", "-qb", "feature", self.base)
+        self.write(path, "PR change")
+        head = self.commit()
+        self.git("checkout", "-qb", "target", self.base)
+        # A watched file introduced only on base must not select this PR.
+        self.write("tokenspeed-kernel-npu/base-only.py", "base change")
+        base = self.commit()
+        self.git("merge", "--no-ff", "-qm", "merge fixture", head)
+        merge = self.git("rev-parse", "HEAD")
+        return {
+            "number": 7,
+            "pull_request": {
+                "base": {"sha": base, "ref": "target"},
+                "head": {"sha": head, "ref": "feature"},
+            },
+        }, merge
+
+    def test_pr_merge_base_diff_ignores_base_only_changes(self):
+        event, merge = self.pr_fixture("docs/pr.md")
+        result = select_suite(
+            self.repo, self.manifest, "pull_request", event, merge, "refs/pull/7/merge"
+        )
+        self.assertFalse(result["should_run"])
+        self.assertEqual(result["changed_files"], 1)
+
+    def test_pr_operator_change_selects_and_wrong_merge_fails(self):
+        event, merge = self.pr_fixture("tokenspeed-kernel-npu/pr.py")
+        result = select_suite(
+            self.repo, self.manifest, "pull_request", event, merge, "refs/pull/7/merge"
+        )
+        self.assert_suite_selected(result)
+        event["pull_request"]["head"]["sha"] = self.base
+        with self.assertRaises(ValueError):
+            select_suite(
+                self.repo,
+                self.manifest,
+                "pull_request",
+                event,
+                merge,
+                "refs/pull/7/merge",
+            )
 
     def test_cli_writes_action_outputs(self):
         event = self.repo / "event.json"
         event.write_text("{}", encoding="utf-8")
         output = self.repo / "output.txt"
-        script = Path(__file__).with_name("npu_operator_changes.py")
+        script = Path(__file__).resolve().parents[1] / "changes.py"
         completed = subprocess.run(
             [
                 sys.executable,
@@ -206,6 +277,10 @@ class ChangeSelectionTests(unittest.TestCase):
                 "workflow_dispatch",
                 "--event-path",
                 str(event),
+                "--checkout-sha",
+                self.base,
+                "--checkout-ref",
+                "refs/heads/test",
                 "--github-output",
                 str(output),
             ],

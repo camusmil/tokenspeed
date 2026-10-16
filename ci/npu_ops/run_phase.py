@@ -33,6 +33,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 
@@ -48,7 +49,7 @@ def parse_args(argv=None):
     parser.add_argument("--repo-root", type=Path, required=True)
     parser.add_argument("--phase", choices=("accuracy", "performance"), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--timeout-seconds", type=positive_seconds, default=600)
+    parser.add_argument("--timeout-seconds", type=positive_seconds, required=True)
     parser.add_argument(
         "--github-summary",
         type=Path,
@@ -60,7 +61,7 @@ def parse_args(argv=None):
 def load_inputs(repo_root):
     root = Path(repo_root).resolve(strict=True)
     scanner = runpy.run_path(
-        str(root / "test/ci_system/npu_operator_changes.py"),
+        str(root / "ci/npu_ops/changes.py"),
         run_name="npu_phase_scanner",
     )
     reporting = runpy.run_path(
@@ -106,7 +107,9 @@ def capture_test(command, repo_root, log_path, timeout_seconds):
     try:
         with path.open("xb") as log:
             decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-            deadline = time.monotonic() + timeout_seconds
+            started = time.monotonic()
+            deadline = started + timeout_seconds
+            next_heartbeat = started + 30
             try:
                 process = subprocess.Popen(
                     command,
@@ -120,7 +123,14 @@ def capture_test(command, repo_root, log_path, timeout_seconds):
                 with selectors.DefaultSelector() as selector:
                     selector.register(process.stdout, selectors.EVENT_READ)
                     while selector.get_map():
-                        remaining = deadline - time.monotonic()
+                        now = time.monotonic()
+                        if now >= next_heartbeat:
+                            print(
+                                f"测试仍在执行：耗时={now-started:.1f}s，日志={path}",
+                                flush=True,
+                            )
+                            next_heartbeat = now + 30
+                        remaining = deadline - now
                         if remaining <= 0:
                             raise TimeoutError(
                                 f"Test exceeded {timeout_seconds} seconds"
@@ -245,6 +255,7 @@ def execute_phase(
     actions = os.environ.get("GITHUB_ACTIONS") == "true"
     for entry in manifest["operators"]:
         name = entry["name"]
+        started = time.monotonic()
         print(f"开始执行：{name}/{phase}", flush=True)
         if actions:
             print(f"::group::{name}/{phase}", flush=True)
@@ -261,8 +272,15 @@ def execute_phase(
         finally:
             if actions:
                 print("::endgroup::", flush=True)
+        print(
+            f"执行结束：{name}/{phase}，exit={result['exit_code']}，"
+            f"耗时={time.monotonic()-started:.2f}s，status={result['status']}",
+            flush=True,
+        )
         results.append(result)
         if not reporting["phase_succeeded"](result, phase):
+            detail = result.get("error") or f"process exit={result['exit_code']}"
+            report_error(f"{name}/{phase}: {detail}")
             print(f"{name}/{phase} 失败，停止后续算子。", flush=True)
             break
     metadata["finished_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -272,6 +290,27 @@ def execute_phase(
     print("结构化报告：", saved["json"]["path"], flush=True)
     print("中文摘要：", saved["markdown"]["path"], flush=True)
     return report["exit_code"]
+
+
+def report_error(message):
+    print(message, file=sys.stderr, flush=True)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error::{escaped}", flush=True)
+
+
+def save_failure_summary(path, phase, message):
+    if path is not None:
+        # Escape raw errors rather than interpreting them as Markdown/HTML.
+        import html
+
+        text = (
+            f"\n### ARM NPU 阶段执行失败\n\n阶段：`{phase}`；后续测试已停止。\n\n"
+            f"<pre>{html.escape(message)}</pre>\n"
+        )
+        with Path(path).open("a", encoding="utf-8") as handle:
+            if handle.write(text) != len(text):
+                raise OSError("Incomplete failure summary write")
 
 
 class PhaseInterrupted(BaseException):
@@ -322,14 +361,21 @@ def main(argv=None):
             args.github_summary,
         )
     except PhaseInterrupted as exc:
-        print(
-            f"阶段已中断：signal={exc.signum}，停止后续测试。",
-            file=sys.stderr,
-            flush=True,
-        )
+        message = f"阶段已中断：signal={exc.signum}，停止后续测试。"
+        report_error(message)
+        try:
+            save_failure_summary(args.github_summary, args.phase, message)
+        except Exception as summary_error:
+            report_error(f"摘要保存失败：{summary_error}")
         return 128 + exc.signum
     except Exception as exc:
-        print(f"阶段执行失败：{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        message = f"阶段执行失败：{type(exc).__name__}: {exc}"
+        traceback.print_exc()
+        report_error(message)
+        try:
+            save_failure_summary(args.github_summary, args.phase, message)
+        except Exception as summary_error:
+            report_error(f"摘要保存失败：{summary_error}")
         return 1
     finally:
         if previous_pythonpath is None:

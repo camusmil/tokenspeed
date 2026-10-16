@@ -1,16 +1,11 @@
 {
   "schema_version": 2,
   "watch_paths": [
-    "tokenspeed-kernel*/**",
-    "tokenspeed-mla/**",
-    "python/tokenspeed/runtime/**",
-    "ops/**",
-    "kernels/**",
-    "**/ops/**",
-    "**/kernels/**",
+    "tokenspeed-kernel-npu/**",
+    "tokenspeed-kernel/python/**",
+    "python/pyproject.toml",
     "ci/npu_ops/**",
-    ".github/workflows/npu-tests.yml",
-    "test/ci_system/*npu*",
+    ".github/workflows/npu-arm-tests.yml",
     "test/ci_system/*ascend*"
   ],
   "expected_plans": "ci/npu_ops/expected-plans.json",
