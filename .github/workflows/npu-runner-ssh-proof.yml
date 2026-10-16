@@ -1,0 +1,32 @@
+name: NPU Runner SSH Proof
+
+on:
+  push:
+    branches:
+      - main
+      - codex/fork-npu-execution-log
+
+permissions: {}
+
+jobs:
+  proof:
+    if: github.repository == 'camusmil/tokenspeed'
+    runs-on: tokenspeed-fork-npu-setup
+    timeout-minutes: 2
+    steps:
+      - name: Append execution proof for SSH viewer
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -un)" = ci-npu
+          test "$RUNNER_NAME" = tokenspeed-fork-npu-01
+          test "$RUNNER_ENVIRONMENT" = self-hosted
+          ts_log=/srv/npu-ci/work/fork-slot0/ci-proof.log
+          test -f "$ts_log"
+          test ! -L "$ts_log"
+          test -w "$ts_log"
+          printf '[CI] time=%s repo=%s host=%s user=%s runner=%s run=%s attempt=%s event=%s ref=%s sha=%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$GITHUB_REPOSITORY" \
+            "$(hostname)" "$(id -un)" "$RUNNER_NAME" \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_EVENT_NAME" \
+            "$GITHUB_REF" "$GITHUB_SHA" | tee -a "$ts_log"
