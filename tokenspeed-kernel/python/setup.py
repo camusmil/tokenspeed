@@ -507,6 +507,7 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "trtllm_allreduce.cu",
             CUDA_CSRC_DIR / "trtllm_allreduce_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_mnnvl_allreduce_fusion.cu",
+            CUDA_CSRC_DIR / "trtllm_mnnvl_sandwich_norm.cu",
             CUDA_CSRC_DIR / "trtllm_reducescatter_fusion.cu",
             CUDA_CSRC_DIR / "trtllm_allgather_fusion.cu",
         ],
@@ -1053,6 +1054,7 @@ setup(
         # Optional JIT adapter for fused AllGather quantization.
         "tokenspeed_kernel.thirdparty.flashinfer": [
             "allgather_quant.cu",
+            "sm90_moe.patch",
         ],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.

@@ -81,7 +81,7 @@ cached position has none, so the runtime admits it with the bound set to `s`
 and the positions `>= s` are recomputed as ordinary prefill input whatever the
 cache holds. The bound limits the probe itself, not a later trim, so excluded
 hit pages are never claimed and the recomputed suffix lands on private pages.
-Only a `Submitted` prompt is probed: a retracted request is never re-probed,
+Only a `Submitted` prompt is probed: a retracted request is never re-probed;
 it comes back by restoring its image (§4), so no position whose logits were
 produced is ever matched against another request's pages or recomputed. The
 decode role of a disaggregated deployment never computes prompt rows (the
@@ -119,8 +119,8 @@ It picks the rule by the group's kind, never by call site:
 
 - *Full-history* groups hold the decode slot — the chunk that
   completes the prompt reserves `decode_input_tokens`, so the first decode step
-  is guaranteed a slot; intermediate chunks reserve nothing, they are not about
-  to decode — raised on a decoding role's first chunk to the rest of the prompt
+  is guaranteed a slot; intermediate chunks reserve nothing because they are
+  not about to decode — raised on a decoding role's first chunk to the rest of the prompt
   plus the admission headroom (§4), so a partially prefetched request is never
   stranded.
 - *Sliding-window* groups recycle slid-out pages, so they hold the decode
@@ -229,7 +229,8 @@ admission states what the pair does through the group's `StateStep`
 stops writing it — the same `PublicationPoint` that publishes the KV tail
 (§1): a fused prompt end (the first decode's admission publishes slot 1 under
 the prompt's key before rotating it into slot 0), a chunk end that falls on a
-junction (§1), and a finish or retraction on every role (`kFinal`: the P's
+junction (§1) or the reusable boundary described below, and a finish or
+retraction on every role (`kFinal`: the P's
 transferred prompt, the D's and the fused engine's last decoded state). An
 ordinary chunk end or decode step publishes nothing for a State group
 (`CompletedPages::publish_state` is false). The key is the key of the exact
@@ -240,6 +241,17 @@ state block is never written again: rotation moves it to slot 0, where it is
 read only, and the next step releases the request's reference while the
 cache keeps the block.
 
+With prefix caching enabled, a prompt longer than `max_scheduled_tokens`
+leaves one extra checkpoint at the last prefix-page boundary before its
+replay tail. The tail is at least one token, `prefix_replay_tokens`, and the
+largest replayable group's window. Cutting a chunk there makes a second
+request with a changed ending reuse the common prefix immediately: the
+prompt-end state cannot serve a hit that must replay its final token. This
+uses the same rotation and publication as a junction, costs at most one
+additional forward, and retains an evictable cache block per State group.
+Prompts within one configured chunk and models without State groups do not
+add this checkpoint; the D role still lands remote prefill in one transfer.
+
 **A finish settles when its last forward has landed.** `forward::Finish`
 (and the P role's `pd::SucceededEvent`) moves a page-holding request to
 `Finishing` and nothing else; after every batch of events,
@@ -249,14 +261,27 @@ pages (`ReleaseEvent`). One path for every schedule: a request that finished
 quiescent settles with its Finish event — the timing every caller always
 saw — and one whose finish was decided on a landed token while the overlap
 schedule had already dispatched the next decode settles when that decode's
-result lands, at the frontier that decode produced (one token further: the
-token the finish was decided on, consumed). The live slot is therefore never
-published while a forward writes it, and a paused loop, which drains its
-forwards without building plans, settles its finishes all the same. The
-runtime reports every landed forward row, tracked or not
+result lands, at the frontier the tokens it reports leave. The live slot is
+therefore never published while a forward writes it, and a paused loop, which
+drains its forwards without building plans, settles its finishes all the
+same. The runtime reports every landed forward row, tracked or not
 (`generation_output_processor`), so the count always reaches zero. A
 `Finishing` request is never scheduled and never a retraction victim; an
 abort releases it without publishing.
+
+**A finish publishes the state before the stop token.** The device ends a
+request where the control plane does: a verify round keeps its accepted
+tokens only through the first stop token and within the token limit, so the
+state commit and the frontier never pass the token the finish is decided on,
+and the decode the overlap schedule dispatched behind that round runs the
+request as a padding row and reports no token. Whatever the schedule and
+however many tokens a round accepts, the finish frontier `T` is therefore the
+stop token's position (the last kept token's for a token limit): the state
+and KV before it, a prefix of the next turn's prompt whether or not its chat
+template keeps the stop token. A finish the device cannot decide (a stop
+string, a grammar, a client abort) reports every token the round kept
+instead, so the frontier still names the state the device holds
+(`cache-concepts.md`, "Recurrent state").
 
 **Hits.** The probe (§1, "What the probe may claim") resumes a hybrid model
 at the longest `T` with a published state checkpoint in every State group and
@@ -265,9 +290,10 @@ claimed cache block (a Host checkpoint is loaded into a fresh slot 0 like any
 Host hit). When the KV groups reach further than the state (`kv_tokens >
 num_common_tokens`), the difference is the junction: the first chunk ends
 there and publishes the checkpoint the cache lacked, so the next prompt that
-shares the prefix resumes at the KV boundary in every group. No alignment is
-ever imposed on a chunk for the state's sake, and no checkpoint is produced
-inside a forward: a chunk's state output is its own natural checkpoint.
+shares the prefix resumes at the KV boundary in every group. Junctions can
+be unaligned; the additional checkpoint before the replay tail is page
+aligned. No checkpoint is produced inside a forward: a chunk's state output
+is its own natural checkpoint.
 `CacheProgress::junction_tokens` is the only progress a State group adds to
 the request; the backend contract for the two slots is in
 [Cache concepts](cache-concepts.md#recurrent-state-two-slots-natural-checkpoints).
@@ -671,7 +697,7 @@ phases.
 
 The P role never retracts: `buildPrefillWorkerPlan` does not call
 `maybeRetractForCapacity` (the only two call sites are the D and fused
-grammars). See 3.1 for why.
+grammars). See §3.1 for why.
 
 ## 3. Per role: explicit phases
 
@@ -951,7 +977,7 @@ before `CompleteSnapshotRestore` republishes its L2-tier destinations — the
 victim's pages left the Device when they were granted away, so their
 descriptors are typically gone by the time the restore lands.
 
-**A readmission that does not fit, waits.** Its failed restore never
+**A readmission that does not fit waits.** Its failed restore never
 triggers retraction (it is never recorded as the capacity blocker): when the
 restore needs a victim, the two do not fit together, and swapping
 them — two images and two restores per swap — is pure thrash. The resident
@@ -988,7 +1014,7 @@ victim policy and it **cannot be retracted again**, and is not aborted either
 (§2): it needs no further page, so it finishes on its own reserve and frees
 its pages then — except where a sliding-window group's growth outruns that
 reserve (§1), which the empty-round retraction covers (§2). This is a
-per-request adaptive backoff: it penalises only the
+per-request adaptive backoff: it penalizes only the
 request whose admission proved over-optimistic, and never makes anyone else
 wait. The constant is a thrash bound only; no liveness argument rests on it.
 
@@ -1019,7 +1045,7 @@ snapshot-pool leg (always, with `--disable-kvstore`) is indexed nowhere and
 visible through no pin, hence the explicit count. A flush is likewise refused
 while any image copy is in flight (`HasAnyInFlight` includes the snapshot
 ops). The pause drain counts suspended requests as waiting, so a correct
-runtime never hits either refusal; they are defence in depth.
+runtime never hits either refusal; they are defense in depth.
 `SnapshotPoolFreeBlocks()` and `HostPoolPinnedBlocks()` are the leak checks:
 with no request suspended both must read empty and zero.
 
