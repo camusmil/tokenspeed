@@ -45,7 +45,7 @@ def _scatter(
     x = tl.load(X + row * WIDTH + off, off < WIDTH, other=0)
     # Null page padding must not race on or corrupt live cache data.
     # Write each valid row into its selected cache location.
-    tl.store(Y + loc * WIDTH + off, x + 1, (off < WIDTH) & (loc >= PAGE) & (loc < CAP))
+    tl.store(Y + loc * WIDTH + off, x, (off < WIDTH) & (loc >= PAGE) & (loc < CAP))
 
 
 def interleave_rope(tensor, positions, cos_sin_cache, *, rope_dim):
