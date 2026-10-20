@@ -26,24 +26,33 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from test.ci.npu_test.changes import load_manifest, select_suite
+from test.ci.npu_test.run_phase import load_inputs
 
-from ci.npu_ops_test.changes import load_manifest, select_suite
-
-ROOT = Path(__file__).resolve().parents[2]
-MANIFEST = ROOT / "ci/npu_ops_test/manifest.json"
-SELECTOR = ROOT / "ci/npu_ops_test/changes.py"
+ROOT = Path(__file__).resolve().parents[3]
+MANIFEST = ROOT / "test/ci/npu_test/manifest.json"
+SELECTOR = ROOT / "test/ci/npu_test/changes.py"
 
 
 class ChangeSelectionTest(unittest.TestCase):
     def setUp(self):
         self.manifest = load_manifest(MANIFEST)
 
+    def test_registered_inputs_load_from_repository_root(self):
+        root, manifest, plan, _ = load_inputs(ROOT)
+        self.assertEqual(root, ROOT)
+        self.assertEqual(manifest, self.manifest)
+        self.assertEqual(
+            set(plan["source_sha256"]),
+            {operator["script"] for operator in manifest["operators"]},
+        )
+
     def test_watched_paths_select_all_operators(self):
         for event in ("pull_request", "push"):
             for path in (
                 "tokenspeed-kernel-npu/python/ops.py",
                 "tokenspeed-kernel/python/shared.py",
-                "ci/npu_ops_test/changes.py",
+                "test/ci/npu_test/changes.py",
                 ".github/workflows/pr-test-ascendnpu-arm.yml",
             ):
                 with self.subTest(event=event, path=path):
@@ -58,7 +67,7 @@ class ChangeSelectionTest(unittest.TestCase):
                 set(),
                 {"python/tokenspeed/runtime.py"},
                 {"tokenspeed-kernel-amd/source.py"},
-                {"tokenspeed-kernel-npu/README.md", "ci/npu_ops_test/guide.RST"},
+                {"tokenspeed-kernel-npu/README.md", "test/ci/npu_test/guide.RST"},
             ):
                 with self.subTest(event=event, paths=paths):
                     result = select_suite(self.manifest, event, paths)

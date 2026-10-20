@@ -65,7 +65,7 @@ jobs:
           NPU_PR_IS_DRAFT: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == true }}
         run: |
           set -euo pipefail
-          python3 -B -m unittest ci.npu_ops_test.test_changes
+          python3 -B -m unittest test.ci.npu_test.test_changes
           changed_files="$RUNNER_TEMP/tokenspeed-changed-files.txt"
           case "${{ github.event_name }}" in
             pull_request)
@@ -85,9 +85,9 @@ jobs:
               : > "$changed_files"
               ;;
           esac
-          python3 -B ci/npu_ops_test/changes.py \
+          python3 -B test/ci/npu_test/changes.py \
             --repo-root "$GITHUB_WORKSPACE" \
-            --manifest ci/npu_ops_test/manifest.json \
+            --manifest test/ci/npu_test/manifest.json \
             --event-name "$GITHUB_EVENT_NAME" \
             --changed-files "$changed_files" \
             --github-output "$GITHUB_OUTPUT" \
@@ -226,7 +226,7 @@ jobs:
           status=$(git -C "$work/checkout" status --porcelain --untracked-files=all)
           [[ -z "$status" ]] || { echo 'Checkout contains modified or untracked files' >&2; exit 1; }
           stage=run-phase
-          bash "$work/checkout/ci/npu_ops_test/run_step.sh" "$NPU_PHASE" "$work"
+          bash "$work/checkout/test/ci/npu_test/run_step.sh" "$NPU_PHASE" "$work"
       - name: Run performance tests for all operators
         id: performance
         if: ${{ success() }}
