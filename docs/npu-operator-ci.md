@@ -49,6 +49,8 @@ The executor starts each manifest `script` with `--mode accuracy` or `--mode per
 The standalone `--mode all` option is a convenience for one operator only. CI does not use it: CI preserves the global ordering of all accuracy tests before any performance test.
 Both steps share the bootstrap through a YAML anchor. Before fetching repository scripts, the accuracy step validates deployment, platform, and event inputs, creates an isolated run/attempt directory, and checks out the requested SHA.
 Only then can it invoke the repository entry point.
+Source download makes one initial `git fetch` attempt and, on failure, up to three retries (four attempts total), waiting 30 seconds before each retry. Every attempt logs its number, original Git errors, and exit code. A successful fetch stops retrying immediately. Exhaustion returns the last failure code and prevents checkout and all operator tests. Cancellation is not retried. Only the fetch command is retried; checkout validation, environment setup, and operator failures still stop immediately. The existing 60-minute job timeout also applies during download and waits.
+There is no cross-run source cache: each run/attempt initializes a fresh Git repository and downloads the exact event SHA. Accuracy and performance reuse that checkout within the same job. Previous run directories are retained as evidence but are not searched or reused. The `tmp`, `cache`, Triton, and Python cache paths are scoped to the current run directory; they are not a persistent source cache.
 The performance step reuses the directory only after accuracy succeeds. Both steps require Linux, `uname -m` equal to `aarch64` or `arm64`, the expected SHA, and a checkout without modified or untracked files.
 Checkout uses the format-checked, allowlisted `GITHUB_REPOSITORY` to fetch public source from `https://github.com/<owner>/<repository>.git` without forwarding access tokens.
 The interpreter path is fixed. Scripts use that interpreter with `-B -u`, and the two kernel package directories in the checkout precede other entries in `PYTHONPATH`.
@@ -106,6 +108,10 @@ It contains `source.txt`, `checkout/`, separate `accuracy/` and `performance/` r
 Each phase directory contains `context.json`, `report.json`, and `summary.md`. Operator directories contain raw logs, `process.json`, `result.json`, and known exit codes.
 Summaries are appended to `GITHUB_STEP_SUMMARY`. JSON reports and raw logs remain on the VM and are not currently uploaded as artifacts.
 Run directories are retained for verification; operators must arrange cleanup. Deploy from a clean baseline worktree rather than reusing a fault-injection branch.
+
+## CPU regression checks
+
+Run `python3 -B -m unittest test.ci.npu_test.test_changes test.ci.npu_test.test_fetch` from the repository root in an environment with PyYAML installed. The retry tests replace only the unavailable remote transport, use real local Git fetches and real 30-second waits, and cover immediate success, recovery on attempts two/four, exhaustion, and cancellation. Independent cases run concurrently and take about 90 seconds overall. They do not run NPU code or require a network connection.
 
 ## Adding cases, operators, and structured events
 
