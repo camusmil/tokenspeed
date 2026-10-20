@@ -14,23 +14,26 @@ The label does not change the order: accuracy always precedes performance.
 The independent `pr-test-npu-arm` concurrency group is keyed by PR or ref. Automatic events cancel older runs in the same group; manual events do not initiate cancellation.
 Unrelated label events use a separate group to avoid canceling an active test run. Test code never runs through `pull_request_target`.
 
-The GitHub-hosted `select` job fetches complete Git history, runs the CPU-only regression tests with `python3 -B -m unittest ci.npu_ops_test.test_changes`, then runs `ci/npu_ops_test/changes.py`:
+The GitHub-hosted `select` job uses the same changed-file collection as NVIDIA ARM and AMD CI, then passes the path list to `ci/npu_ops_test/changes.py`:
 
-- Pushes compare the `before` and `after` commits. An all-zero `before` conservatively selects the full suite. With the current main-only trigger, this applies when creating main or invoking the selector independently.
-- PRs require the checkout to be the two-parent merge commit identified by `GITHUB_SHA`, with its second parent matching the event's head SHA. Its first parent must equal or descend from the event's base SHA, allowing the target branch to advance. Selection compares `merge-base(first_parent, head)..head`, excluding changes introduced only on base, including base updates already incorporated by the PR. Tests execute the merge SHA, not the head SHA.
+- PRs use the paginated GitHub `/pulls/{number}/files` API. Both `filename` and `previous_filename` are classified, including renames into or out of watched paths.
+- Pushes use the GitHub `/compare/{before}...{after}` API and classify both filename fields.
 - Manual runs execute the full suite at the selected branch or tag's `GITHUB_SHA`.
-- Invalid SHAs, refs, missing Git objects, or comparison failures fail selection instead of silently skipping tests. Tag pushes and branch deletion do not start operator tests.
+- API or path-input failures fail selection instead of silently skipping tests. The read-only token needs `contents: read` and `pull-requests: read`.
+
+Like NVIDIA/AMD selection, this does not compare event base/head SHAs against the merge commit's parents or require full Git history. GitHub's current API file list supplies selection; it is not an immutable snapshot on reruns. PR-file and compare-API limits are inherited from the GPU approach. Tests still execute the event's `GITHUB_SHA`, with the hardware checkout SHA and cleanliness checks unchanged.
 
 Path rules in `ci/npu_ops_test/manifest.json` cover the NPU package, the shared `tokenspeed-kernel/python/` dependency, dependency configuration, NPU CI scripts, and this workflow.
-Documentation changes ending in `.md` or `.rst` are excluded. Matching is case-sensitive and includes additions, modifications, deletions, and both sides of a rename, without a file-count limit.
+Documentation changes ending in `.md` or `.rst` are excluded. Matching is case-sensitive and includes additions, modifications, deletions, and both sides of a rename, within the GitHub API response limits.
 Any matching path selects every registered operator. Unrelated changes emit `should_run=false` and `reason=no-watched-changes`.
 The workflow has no top-level path filter, so unrelated changes still produce a selection result.
+The existing selection step prints an English scheduling decision and writes it to the Actions summary, distinguishing unrelated changes, disabled hardware, draft PRs, and runner requests. A selected, enabled, non-draft run without `TOKENSPEED_NPU_ARM_RUNNER_NAME` fails before queuing hardware. Requesting a runner is not proof of NPU execution.
 NVIDIA/AMD workflows, shared path filters, task pipelines, and cancellation/retry controllers are unchanged.
 NPU CI implementation and operator tests live under `ci/npu_ops_test/`; new operators do not require changes to GPU task lists under `test/**`.
 
 ## Components and execution order
 
-- `ci/npu_ops_test/changes.py`: validates the manifest and event identity, then selects relevant changes.
+- `ci/npu_ops_test/changes.py`: validates the manifest and classifies the supplied API paths.
 - `ci/npu_ops_test/manifest.json`: schema version 3; defines watched paths, operator order, one `script` path per operator, and expected counts.
 - `ci/npu_ops_test/expected-plans.json`: retains schema version 2; records accuracy cases, performance configurations, sampling parameters, and associated hashes.
 - `ci/npu_ops_test/run_step.sh`: checks ARM/Linux after checkout and prepares the host lock, environment, and caches.
@@ -79,7 +82,7 @@ The host lock covers environment preparation and execution within each phase and
 
 ## Runner deployment contract and evidence locations
 
-`runs-on` uses only the dedicated `tokenspeed-npu-arm64` label, without adding the default `self-hosted` label.
+`runs-on` uses only the dedicated `ascend-npu-ops-test` label, without adding the default `self-hosted` label.
 The hardware job is disabled by default. These are deployment requirements, not assertions that upstream already has a runner, NPU, or configured runtime.
 From the repository home page, open **Settings > Secrets and variables > Actions > Variables** and configure these repository variables:
 
@@ -89,8 +92,8 @@ From the repository home page, open **Settings > Secrets and variables > Actions
 | `TOKENSPEED_NPU_ARM_RUNNER_NAME` | Must match the registered runner name and runtime `RUNNER_NAME`; there is no default |
 | `TOKENSPEED_NPU_ARM_CI_ENABLED` | Set to `true` only after deployment requirements are met; leave unset to disable the hardware job |
 
-Assign the dedicated label to an online Linux ARM64 NPU runner running under the `ci-npu` service account.
-Once enabled, a missing or mismatched runner-name variable fails the step before checkout.
+Assign the dedicated label to an online Linux ARM64 NPU runner running under the `ci-npu` service account. Runner names, labels, and runner groups are separate settings: the registered name or group does not supply this label. Existing runners can retain their other labels when `ascend-npu-ops-test` is added. Organization runner groups must also permit this repository and workflow.
+Once enabled, a missing runner-name variable fails selection before queuing; a mismatched value fails the hardware step before checkout.
 If no online runner has the required label, the job waits for scheduling and cannot execute runtime checks.
 The environment entry point is `/srv/tokenspeed-npu/cann9-torch29-py312-root/env.sh`, and the interpreter is `venv/bin/python` under the same directory.
 Working CANN, torch, torch_npu, and Triton Ascend dependencies and NPU device access for that account are required. Installing the runner alone is insufficient.

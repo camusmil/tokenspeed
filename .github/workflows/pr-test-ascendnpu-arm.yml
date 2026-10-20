@@ -30,6 +30,7 @@ name: PR Test Ascend NPU ARM
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: pr-test-npu-arm-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'high priority' && format('-ignored-label-{0}', github.run_id) || '' }}
@@ -49,27 +50,94 @@ jobs:
       should_run: ${{ steps.changes.outputs.should_run }}
       reason: ${{ steps.changes.outputs.reason }}
     steps:
-      - name: Check out event commit and full history
+      - name: Check out event commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 0
           persist-credentials: false
       - name: Select operator tests
         id: changes
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPU_ARM_CI_ENABLED: ${{ vars.TOKENSPEED_NPU_ARM_CI_ENABLED }}
+          NPU_ARM_RUNNER_NAME: ${{ vars.TOKENSPEED_NPU_ARM_RUNNER_NAME }}
+          NPU_PR_IS_DRAFT: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == true }}
         run: |
           set -euo pipefail
           python3 -B -m unittest ci.npu_ops_test.test_changes
+          changed_files="$RUNNER_TEMP/tokenspeed-changed-files.txt"
+          case "${{ github.event_name }}" in
+            pull_request)
+              gh api \
+                "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+                --paginate \
+                -q '.[] | .filename, (.previous_filename // empty)' \
+                > "$changed_files"
+              ;;
+            push)
+              gh api \
+                "/repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.event.after }}" \
+                -q '.files[] | .filename, (.previous_filename // empty)' \
+                > "$changed_files"
+              ;;
+            *)
+              : > "$changed_files"
+              ;;
+          esac
           python3 -B ci/npu_ops_test/changes.py \
             --repo-root "$GITHUB_WORKSPACE" \
             --manifest ci/npu_ops_test/manifest.json \
             --event-name "$GITHUB_EVENT_NAME" \
-            --event-path "$GITHUB_EVENT_PATH" \
-            --checkout-sha "$GITHUB_SHA" \
-            --checkout-ref "$GITHUB_REF" \
+            --changed-files "$changed_files" \
             --github-output "$GITHUB_OUTPUT" \
             | tee "$RUNNER_TEMP/npu-change-selection.json"
+          python3 -B - "$RUNNER_TEMP/npu-change-selection.json" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          selection = json.loads(Path(sys.argv[1]).read_text())
+          enabled = os.environ["NPU_ARM_CI_ENABLED"].lower() == "true"
+          draft = os.environ["NPU_PR_IS_DRAFT"] == "true"
+          runner_name_configured = bool(os.environ["NPU_ARM_RUNNER_NAME"].strip())
+          reasons = []
+          if not selection["should_run"]:
+              reasons.append(selection["reason"])
+          if not enabled:
+              reasons.append("hardware-disabled")
+          if draft:
+              reasons.append("draft-pr")
+          action = "skip" if reasons else "request-runner"
+          if action == "request-runner" and not runner_name_configured:
+              action = "fail"
+              reasons.append("missing-runner-name")
+          decision = {
+              "hardware_action": action,
+              "reasons": reasons,
+              "selection_reason": selection["reason"],
+              "should_run": selection["should_run"],
+              "hardware_enabled": enabled,
+              "draft_pr": draft,
+              "required_runner_label": "ascend-npu-ops-test",
+              "runner_name_configured": runner_name_configured,
+          }
+          print(json.dumps(decision, indent=2), flush=True)
+          summary = [
+              "### Ascend NPU ARM scheduling decision", "",
+              "| Field | Value |", "| --- | --- |",
+              *[f"| {key} | `{json.dumps(value)}` |" for key, value in decision.items()],
+              "",
+              "Requesting a runner does not mean the operators have run. "
+              "GitHub must find an available runner with the required label and repository access.",
+              "",
+          ]
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as output:
+              output.write("\n".join(summary))
+          if action == "fail":
+              raise SystemExit("Repository variable TOKENSPEED_NPU_ARM_RUNNER_NAME must be configured")
+          PY
 
   npu:
     name: Ascend NPU ARM operator tests
@@ -78,7 +146,7 @@ jobs:
       vars.TOKENSPEED_NPU_ARM_CI_ENABLED == 'true' &&
       needs.select.outputs.should_run == 'true' &&
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    runs-on: tokenspeed-npu-arm64
+    runs-on: ascend-npu-ops-test
     env:
       TOKENSPEED_NPU_CI_REPOSITORY: ${{ vars.TOKENSPEED_NPU_CI_REPOSITORY }}
       TOKENSPEED_NPU_ARM_RUNNER_NAME: ${{ vars.TOKENSPEED_NPU_ARM_RUNNER_NAME }}
