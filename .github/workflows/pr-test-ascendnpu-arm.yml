@@ -24,7 +24,7 @@ name: PR Test Ascend NPU ARM
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, codex/npu-ci-event-validation]
     types: [opened, synchronize, reopened, ready_for_review, labeled]
   workflow_dispatch:
 
