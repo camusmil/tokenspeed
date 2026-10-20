@@ -53,10 +53,15 @@ echo 'Preparing cache directories for this run'
 export TMPDIR="$work/tmp"
 export XDG_CACHE_HOME="$work/cache"
 export TRITON_CACHE_DIR="$work/cache/triton"
-export PYTHONPYCACHEPREFIX="$work/cache/pycache"
+export PYTHONDONTWRITEBYTECODE=1
 export PYTHONUNBUFFERED=1
-mkdir -p "$TMPDIR" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$PYTHONPYCACHEPREFIX"
+mkdir -p "$TMPDIR" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR"
 echo "Starting phase executor: $phase"
+# Operator output is already streamed and persisted by the phase executor.
+# Restore the console to avoid duplicating it in the bootstrap log.
+if [[ "${NPU_BOOTSTRAP_LOGGING:-}" = 1 ]]; then
+  exec 1>&3 2>&4
+fi
 # Keep the lock in the executor process; it cleans up the child process group.
 exec /srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B -u \
   test/ci/npu_test/run_phase.py --repo-root "$PWD" --phase "$phase" \

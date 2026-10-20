@@ -373,15 +373,20 @@ def main(argv=None):
         message = f"Phase interrupted: signal={exc.signum}; remaining tests have been stopped."
         report_error(message)
         try:
+            Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+            save_text(Path(args.output_dir) / "executor-error.log", message + "\n")
             save_failure_summary(args.github_summary, args.phase, message)
         except Exception as summary_error:
             report_error(f"Failed to save summary: {summary_error}")
         return 128 + exc.signum
     except Exception as exc:
         message = f"Phase execution failed: {type(exc).__name__}: {exc}"
-        traceback.print_exc()
+        detail = traceback.format_exc()
+        sys.stderr.write(detail)
         report_error(message)
         try:
+            Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+            save_text(Path(args.output_dir) / "executor-error.log", detail)
             save_failure_summary(args.github_summary, args.phase, message)
         except Exception as summary_error:
             report_error(f"Failed to save summary: {summary_error}")

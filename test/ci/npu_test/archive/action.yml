@@ -1,0 +1,71 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+name: Archive NPU CI evidence
+description: Preserve NPU evidence before removing this job's disposable files.
+inputs:
+  work:
+    description: Managed work directory for this run and attempt
+    required: true
+  accuracy:
+    description: Accuracy step outcome
+    required: true
+  performance:
+    description: Performance step outcome
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Collect evidence
+      id: collect
+      shell: bash
+      env:
+        NPU_ARCHIVE_WORK: ${{ inputs.work }}
+      run: |
+        /srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B \
+          "$NPU_CI_RUNTIME/lifecycle.py" --policy "$NPU_CI_RUNTIME/policy.json" \
+          collect --work "$NPU_ARCHIVE_WORK"
+    - name: Upload evidence
+      id: upload
+      if: ${{ steps.collect.outcome == 'success' }}
+      continue-on-error: true
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+      with:
+        name: npu-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ steps.collect.outputs.path }}
+        retention-days: 30
+        if-no-files-found: error
+        include-hidden-files: false
+    - name: Record upload result and release work files
+      if: ${{ always() && steps.collect.outcome == 'success' }}
+      shell: bash
+      env:
+        NPU_ARCHIVE_WORK: ${{ inputs.work }}
+        NPU_ACCURACY_OUTCOME: ${{ inputs.accuracy }}
+        NPU_PERFORMANCE_OUTCOME: ${{ inputs.performance }}
+        NPU_UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+        NPU_ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+        NPU_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+      run: |
+        /srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B \
+          "$NPU_CI_RUNTIME/lifecycle.py" --policy "$NPU_CI_RUNTIME/policy.json" \
+          ack --work "$NPU_ARCHIVE_WORK" --outcome "$NPU_UPLOAD_OUTCOME" \
+          --artifact-id "$NPU_ARTIFACT_ID" --artifact-digest "$NPU_ARTIFACT_DIGEST" \
+          --accuracy "$NPU_ACCURACY_OUTCOME" --performance "$NPU_PERFORMANCE_OUTCOME"

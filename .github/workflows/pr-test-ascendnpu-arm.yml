@@ -147,10 +147,12 @@ jobs:
       needs.select.outputs.should_run == 'true' &&
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ascend-npu-ops-test
+    timeout-minutes: 60
     env:
       TOKENSPEED_NPU_CI_REPOSITORY: ${{ vars.TOKENSPEED_NPU_CI_REPOSITORY }}
       TOKENSPEED_NPU_ARM_RUNNER_NAME: ${{ vars.TOKENSPEED_NPU_ARM_RUNNER_NAME }}
-    timeout-minutes: 60
+      NPU_CI_RUNTIME: /srv/npu-ci/runtime/evidence-v1
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Run accuracy tests for all operators
         id: accuracy
@@ -162,6 +164,11 @@ jobs:
           set -Eeuo pipefail
           stage=bootstrap
           started=$SECONDS
+          work=""
+          log_pid=""
+          python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
+          helper="$NPU_CI_RUNTIME/lifecycle.py"
+          policy="$NPU_CI_RUNTIME/policy.json"
           finish() {
             rc=$?
             trap - EXIT
@@ -172,6 +179,15 @@ jobs:
                 "$NPU_PHASE" "$stage" "$rc" >> "$GITHUB_STEP_SUMMARY" || rc=1
             fi
             printf 'ARM NPU phase finished: %s, exit=%s, elapsed=%ss\n' "$NPU_PHASE" "$rc" "$((SECONDS-started))"
+            if [[ -n "$log_pid" ]]; then
+              exec 1>&3 2>&4
+              wait "$log_pid" || { (( rc != 0 )) || rc=1; }
+            fi
+            if [[ -n "$work" ]]; then
+              "$python" -B "$helper" --policy "$policy" phase --work "$work" \
+                --phase "$NPU_PHASE" --stage "$stage" --exit "$rc" \
+                || { (( rc != 0 )) || rc=1; }
+            fi
             exit "$rc"
           }
           trap finish EXIT
@@ -182,20 +198,26 @@ jobs:
             [[ "$2" = "$3" ]] || { printf '%s does not match the deployment contract\n' "$1" >&2; return 1; }
           }
           fetch_source() {
-            local attempt rc=1
+            local attempt rc=1 attempt_started attempt_at
             for attempt in 1 2 3 4; do
-              printf 'Fetching source: attempt %s/4, SHA=%s\n' "$attempt" "$GITHUB_SHA"
-              # Public repository: do not forward credentials into PR test processes.
+              attempt_started=$SECONDS
+              attempt_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+              printf '%s Fetching source: attempt %s/4, SHA=%s\n' "$attempt_at" "$attempt" "$GITHUB_SHA"
+              # The enclosing bootstrap streams this output to one local log.
               if GIT_TERMINAL_PROMPT=0 git -C "$work/checkout" -c credential.helper= \
                 fetch --no-tags --depth=1 \
                 "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"; then
-                printf 'Source fetch succeeded on attempt %s/4\n' "$attempt"
-                return 0
+                rc=0
               else
                 rc=$?
               fi
+              printf '%s\t%s\t%s\t%s\t%s\n' "$attempt" "$attempt_at" \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$((SECONDS-attempt_started))" "$rc" >> "$work/fetch.tsv"
+              if (( rc == 0 )); then
+                printf 'Source fetch succeeded on attempt %s/4\n' "$attempt"
+                return 0
+              fi
               printf 'Source fetch attempt %s/4 failed (exit=%s)\n' "$attempt" "$rc" >&2
-              # Cancellation must stop the job rather than schedule another fetch.
               if (( rc == 130 || rc == 143 )); then
                 return "$rc"
               fi
@@ -207,7 +229,17 @@ jobs:
             printf 'Source fetch failed after 4 attempts (exit=%s)\n' "$rc" >&2
             return "$rc"
           }
+          if [[ "$NPU_PHASE" = accuracy ]]; then
+            work=$("$python" -B "$helper" --policy "$policy" init)
+          else
+            work="${NPU_CI_WORK:?Missing accuracy checkout}"
+          fi
+          exec 3>&1 4>&2
+          exec > >("$python" -B "$helper" --policy "$policy" log --work "$work") 2>&1
+          log_pid=$!
+          export NPU_BOOTSTRAP_LOGGING=1
           echo "ARM NPU phase started: $NPU_PHASE"
+          echo "Run directory: $work"
           stage=deployment-contract
           [[ -n "${TOKENSPEED_NPU_ARM_RUNNER_NAME:-}" ]] || { echo 'Repository variable TOKENSPEED_NPU_ARM_RUNNER_NAME must be configured' >&2; exit 1; }
           require_equal runner "$TOKENSPEED_NPU_ARM_RUNNER_NAME" "$RUNNER_NAME"
@@ -230,9 +262,6 @@ jobs:
           git check-ref-format "$GITHUB_REF"
           if [[ "$NPU_PHASE" = accuracy ]]; then
             stage=checkout
-            work=$(mktemp -d "/srv/npu-ci/jobs/slot0/actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.XXXXXXXX")
-            echo "Run directory: $work"
-            printf 'NPU_CI_WORK=%s\n' "$work" >> "$GITHUB_ENV"
             git init -q "$work/checkout"
             fetch_source
             git -C "$work/checkout" -c core.hooksPath=/dev/null checkout -q --detach FETCH_HEAD
@@ -257,3 +286,10 @@ jobs:
         env:
           NPU_PHASE: performance
         run: *npu-bootstrap
+      - name: Archive NPU CI evidence
+        if: ${{ always() }}
+        uses: ./.npu-ci-archive
+        with:
+          work: ${{ env.NPU_CI_WORK }}
+          accuracy: ${{ steps.accuracy.outcome }}
+          performance: ${{ steps.performance.outcome }}

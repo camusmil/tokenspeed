@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily NPU CI retention
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 Asia/Shanghai
+Persistent=true
+Unit=npu-ci-retention.service
+
+[Install]
+WantedBy=timers.target
