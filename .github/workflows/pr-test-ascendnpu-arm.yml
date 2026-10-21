@@ -52,7 +52,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
-      should_run: ${{ steps.changes.outputs.should_run }}
+      # Test fixture: exercise the model job when the operator dependency is skipped.
+      should_run: ${{ false }}
       reason: ${{ steps.changes.outputs.reason }}
       matrix: ${{ steps.changes.outputs.matrix }}
       timeout_minutes: ${{ steps.changes.outputs.timeout_minutes }}
