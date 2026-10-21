@@ -14,15 +14,17 @@ The label does not change the order: accuracy always precedes performance.
 The independent `pr-test-npu-arm` concurrency group is keyed by PR or ref. Automatic events cancel older runs in the same group; manual events do not initiate cancellation.
 Unrelated label events use a separate group to avoid canceling an active test run. Test code never runs through `pull_request_target`.
 
-The GitHub-hosted `select` job fetches complete Git history, runs the CPU-only regression tests with `python3 -B -m unittest ci.npu_ops_test.test_changes`, then runs `ci/npu_ops_test/changes.py`:
+The GitHub-hosted `select` job checks out the event commit, runs the CPU-only API regression tests with `python3 -B -m unittest ci.npu_ops_test.test_changes`, then runs `ci/npu_ops_test/changes.py`. Selection uses the same GitHub API change-list checks as the independent NPU workflow:
 
-- Pushes compare the `before` and `after` commits. An all-zero `before` conservatively selects the full suite. With the current main-only trigger, this applies when creating main or invoking the selector independently.
-- PRs require the checkout to be the two-parent merge commit identified by `GITHUB_SHA`, with its second parent matching the event's head SHA. Its first parent must equal or descend from the event's base SHA, allowing the target branch to advance. Selection compares `merge-base(first_parent, head)..head`, excluding changes introduced only on base, including base updates already incorporated by the PR. Tests execute the merge SHA, not the head SHA.
-- Manual runs execute the full suite at the selected branch or tag's `GITHUB_SHA`.
-- Invalid SHAs, refs, missing Git objects, or comparison failures fail selection instead of silently skipping tests. Tag pushes and branch deletion do not start operator tests.
+- PRs read every page of `/pulls/<number>/files` with 100 files per page. The current PR head and base must match the event before and after reading; the file count must remain stable and match the complete response. More than 3,000 files, duplicates, malformed paths, or partial responses fail selection.
+- Pushes read `/compare/<before>...<after>`. Both SHAs must be nonzero. Responses with 300 or more files fail because the compare API may truncate the list. Creating a branch with an all-zero `before` fails selection instead of guessing missing changes.
+- Manual runs select the full suite without an API file request.
+- Renames check both `filename` and `previous_filename`; API failures fail the job instead of silently skipping tests.
+
+The selector uses the event's PR identity and the complete API file list, without depending on the parents of GitHub's temporary test-merge commit. GitHub may supply an older test-merge SHA while refreshing that reference. The hardware job still checks out and verifies the event's exact `GITHUB_SHA`; selection does not substitute the PR head SHA. The selection step receives only the read-permission `GITHUB_TOKEN` through `GH_TOKEN`; no token is passed to operator test processes.
 
 Path rules in `ci/npu_ops_test/manifest.json` cover the NPU package, the shared `tokenspeed-kernel/python/` dependency, dependency configuration, NPU CI scripts, the task YAML and pipeline, and both the NPU caller and shared task workflow.
-Documentation changes ending in `.md` or `.rst` are excluded. Matching is case-sensitive and includes additions, modifications, deletions, and both sides of a rename, without a file-count limit.
+Documentation changes ending in `.md` or `.rst` are excluded. Matching is case-sensitive and includes additions, modifications, deletions, and both sides of a rename within the API completeness limits above.
 Any matching path selects every registered operator. Unrelated changes emit `should_run=false` and `reason=no-watched-changes`.
 The workflow has no top-level path filter, so unrelated changes still produce a selection result.
 The caller passes the selected `test/ci/ut/npu-operators.yaml` task to `.github/workflows/run-ci-task-matrix.yml`, using the dedicated NPU runner label. This shared workflow invokes `test/ci_system/pipeline.py` in the existing NPU environment; the task has no dependency-install stage or Docker requirement.

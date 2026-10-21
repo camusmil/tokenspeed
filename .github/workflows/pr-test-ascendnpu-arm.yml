@@ -30,6 +30,7 @@ name: PR Test Ascend NPU ARM
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: pr-test-npu-arm-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'high priority' && format('-ignored-label-{0}', github.run_id) || '' }}
@@ -50,15 +51,17 @@ jobs:
       reason: ${{ steps.changes.outputs.reason }}
       matrix: ${{ steps.scan.outputs.matrix || '{"include":[]}' }}
     steps:
-      - name: Check out event commit and full history
+      - name: Check out event commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
       - name: Select operator tests
         id: changes
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           python3 -B -m unittest ci.npu_ops_test.test_changes
@@ -67,8 +70,7 @@ jobs:
             --manifest ci/npu_ops_test/manifest.json \
             --event-name "$GITHUB_EVENT_NAME" \
             --event-path "$GITHUB_EVENT_PATH" \
-            --checkout-sha "$GITHUB_SHA" \
-            --checkout-ref "$GITHUB_REF" \
+            --repository "$GITHUB_REPOSITORY" \
             --github-output "$GITHUB_OUTPUT" \
             | tee "$RUNNER_TEMP/npu-change-selection.json"
 
