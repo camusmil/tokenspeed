@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Select the NPU operator suite from GitHub API changed paths."""
+"""Select NPU operator and model tasks from one complete GitHub API change list."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ import subprocess
 from fnmatch import fnmatchcase
 from pathlib import Path
 
-from pipeline import CONFIG_PATH, load_task
+from pipeline import CONFIG_PATH, MODEL_CONFIG_PATH, config_path, load_task
 
 
 def select_suite(task: dict, event_name: str, paths: set[str]) -> dict:
@@ -143,7 +143,7 @@ def changed_paths(repository, event_name, event, api=github_json):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, required=True)
-    parser.add_argument("--task", type=Path, required=True)
+    parser.add_argument("--task", type=Path, action="append", required=True)
     parser.add_argument(
         "--event-name",
         choices=("push", "pull_request", "workflow_dispatch"),
@@ -154,29 +154,54 @@ def main() -> int:
     parser.add_argument("--github-output", type=Path)
     args = parser.parse_args()
     try:
-        task = load_task(args.repo_root / args.task)
+        tasks = [load_task(args.repo_root / path) for path in args.task]
+        if len({task["workflow_stage"] for task in tasks}) != len(tasks):
+            raise ValueError("Duplicate task stage")
+        for path, task in zip(args.task, tasks):
+            if str(path) != config_path(task):
+                raise ValueError("Task path and declared identity differ")
         paths = changed_paths(
             args.repository, args.event_name, json.loads(args.event_path.read_text())
         )
-        result = select_suite(task, args.event_name, paths)
-        matrix = {
-            "include": (
-                [
-                    {key: task[key] for key in ("name", "type", "runner")}
-                    | {"config": CONFIG_PATH}
-                ]
-                if result["should_run"]
-                else []
-            )
-        }
-        result["matrix"] = matrix
-        result["timeout_minutes"] = task["timeouts"]["job_minutes"]
+        stages = {}
+        for task in tasks:
+            selection = select_suite(task, args.event_name, paths)
+            selection["matrix"] = {
+                "include": (
+                    [
+                        {key: task[key] for key in ("name", "type", "runner")}
+                        | {"config": config_path(task)}
+                    ]
+                    if selection["should_run"]
+                    else []
+                )
+            }
+            selection["timeout_minutes"] = task["timeouts"]["job_minutes"]
+            stages[task["workflow_stage"]] = selection
+        result = dict(
+            stages["operator"] if "operator" in stages else stages["model"],
+            stages=stages,
+        )
         if args.github_output is not None:
             with args.github_output.open("a", encoding="utf-8") as output:
-                output.write(f"should_run={str(result['should_run']).lower()}\n")
-                output.write(f"reason={result['reason']}\n")
-                output.write(f"matrix={json.dumps(matrix)}\n")
-                output.write(f"timeout_minutes={task['timeouts']['job_minutes']}\n")
+                for stage, selection in stages.items():
+                    for key in ("should_run", "reason", "matrix", "timeout_minutes"):
+                        value = selection[key]
+                        rendered = (
+                            json.dumps(value)
+                            if isinstance(value, (dict, bool))
+                            else str(value)
+                        )
+                        output.write(f"{stage}_{key}={rendered}\n")
+                # Preserve the single-suite CLI outputs for direct callers.
+                for key in ("should_run", "reason", "matrix", "timeout_minutes"):
+                    value = result[key]
+                    rendered = (
+                        json.dumps(value)
+                        if isinstance(value, (dict, bool))
+                        else str(value)
+                    )
+                    output.write(f"{key}={rendered}\n")
         print(json.dumps(result, indent=2))
         return 0
     except (

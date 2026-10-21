@@ -4,7 +4,7 @@
     "tokenspeed-kernel-npu/**",
     "tokenspeed-kernel/python/**",
     "python/pyproject.toml",
-    "test/ci/npu_test/**",
+    "test/ci/npu_test/ut-tokenspeed-kernel-npu.json",
     ".github/workflows/pr-test-ascendnpu-arm.yml",
     "test/ci_system/*ascend*",
     "test/ci_system/npu/**",

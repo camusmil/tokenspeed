@@ -869,6 +869,39 @@ def save_report(report, output_dir, github_summary=None):
 # Task declaration
 
 CONFIG_PATH = "test/ci/npu_test/ut-tokenspeed-kernel-npu.json"
+MODEL_CONFIG_PATH = "test/ci/npu_test/qwen-npu-smoke.json"
+TASKS = {
+    CONFIG_PATH: ("ut-tokenspeed-kernel-npu", "ut", "operator"),
+    MODEL_CONFIG_PATH: ("qwen-npu-smoke", "model_smoke", "model"),
+}
+
+
+def config_path(task):
+    for path, identity in TASKS.items():
+        if tuple(task[key] for key in ("name", "type", "workflow_stage")) == identity:
+            return path
+    raise ReportError("Unsupported task identity")
+
+
+def task_phases(state):
+    # Old v0.6 directories contain only the operator suite and no task tag.
+    if "task_config" not in state:
+        require("task_name" not in state, "Missing task config")
+        return ("accuracy", "performance")
+    require(state["task_config"] in TASKS, "Unknown selected task")
+    require(
+        TASKS[state["task_config"]][0] == state["task_name"], "Task identity mismatch"
+    )
+    return (
+        ("runtime", "model")
+        if state["task_config"] == MODEL_CONFIG_PATH
+        else ("accuracy", "performance")
+    )
+
+
+def run_key(state):
+    suffix = f"-{state['task_name']}" if "task_name" in state else ""
+    return f"{state['run_id']}-{state['attempt']}{suffix}"
 
 
 def load_task(path):
@@ -878,34 +911,44 @@ def load_task(path):
         type(task.get("schema_version")) is int and task["schema_version"] == 1,
         "Expected task schema_version=1",
     )
-    require(task.get("name") == "ut-tokenspeed-kernel-npu", "Invalid task name")
-    require(
-        task.get("type") == "ut" and task.get("workflow_stage") == "operator",
-        "Invalid task type/stage",
-    )
+    selected = config_path(task)
+    model = selected == MODEL_CONFIG_PATH
     require(
         task.get("triggers") == ["push", "pull_request", "workflow_dispatch"],
         "Invalid triggers",
     )
     require(
-        task.get("execution")
-        == {"phases": ["accuracy", "performance"], "fail_fast": True},
+        same_json(
+            task.get("execution"),
+            {
+                "phases": (
+                    ["runtime", "model"] if model else ["accuracy", "performance"]
+                ),
+                "fail_fast": True,
+            },
+        ),
         "Invalid phase ordering or fail-fast policy",
     )
+    if not model:
+        require(
+            task.get("performance_policy") == {"verdict": "not_evaluated"},
+            "Unsupported performance policy",
+        )
     require(
-        task.get("performance_policy") == {"verdict": "not_evaluated"},
-        "Unsupported performance policy",
-    )
-    require(
-        task.get("resources")
-        == {"architecture": "aarch64", "device_ids": [0], "exclusive_host": True},
+        same_json(
+            task.get("resources"),
+            {"architecture": "aarch64", "device_ids": [0], "exclusive_host": True},
+        ),
         "Unsupported VM resource request",
     )
     limits = task.get("timeouts")
     require(
         type(limits) is dict
         and set(limits)
-        == {"lock_wait_seconds", "phase_execution_seconds", "job_minutes"},
+        == (
+            {"lock_wait_seconds", "phase_execution_seconds", "job_minutes"}
+            | ({"runtime_install_seconds"} if model else set())
+        ),
         "Missing timeout limits",
     )
     require(
@@ -913,7 +956,13 @@ def load_task(path):
         "Timeout limits must be positive integers",
     )
     require(
-        2 * (limits["lock_wait_seconds"] + limits["phase_execution_seconds"])
+        (
+            limits["runtime_install_seconds"]
+            + limits["lock_wait_seconds"]
+            + limits["phase_execution_seconds"]
+            if model
+            else 2 * (limits["lock_wait_seconds"] + limits["phase_execution_seconds"])
+        )
         < limits["job_minutes"] * 60,
         "Job timeout must leave time for bootstrap and archive",
     )
@@ -924,31 +973,92 @@ def load_task(path):
         and all(type(p) is str and p for p in patterns),
         "Invalid watch_paths",
     )
-    operators = task.get("operators")
-    require(type(operators) is list and operators, "Empty operator task")
-    names, scripts = set(), set()
-    for entry in operators:
+    if model:
         require(
-            type(entry) is dict and set(entry) == {"name", "script"},
-            "Invalid operator registration",
+            task.get("script") == "test/runtime/models/qwen_npu_smoke.py",
+            "Unsupported model entry",
         )
-        name, script = entry["name"], entry["script"]
+        value = task.get("model")
         require(
-            type(name) is str and re.fullmatch(r"[a-z][a-z0-9_]*", name),
-            "Invalid operator name",
+            type(value) is dict
+            and set(value)
+            == {
+                "id",
+                "revision",
+                "manifest_sha256",
+                "dtype",
+                "device",
+                "device_count",
+                "tp_size",
+                "dp_size",
+                "pp_size",
+                "prompt",
+                "max_new_tokens",
+                "seed",
+                "verdict",
+                "sampling_backend",
+                "temperature",
+            },
+            "Invalid model contract",
         )
         require(
-            type(script) is str
-            and re.fullmatch(
-                r"tokenspeed-kernel/test/npu/ops/test_[a-z0-9_]+\.py", script
+            value["id"] == "Qwen/Qwen3-0.6B"
+            and re.fullmatch(r"[0-9a-f]{40}", value["revision"])
+            and re.fullmatch(r"[0-9a-f]{64}", value["manifest_sha256"]),
+            "Invalid model identity",
+        )
+        require(
+            value["device"] == "npu"
+            and value["dtype"] == "bfloat16"
+            and value["verdict"] == "smoke_only"
+            and value["sampling_backend"] == "greedy"
+            and type(value["temperature"]) in (int, float)
+            and value["temperature"] == 0.0,
+            "Unsupported model mode",
+        )
+        require(
+            all(
+                type(value[k]) is int and value[k] == 1
+                for k in ("device_count", "tp_size", "dp_size", "pp_size")
             ),
-            "Invalid test entry path",
+            "Model smoke requires one native NPU",
         )
         require(
-            name not in names and script not in scripts, "Duplicate operator or script"
+            type(value["prompt"]) is str
+            and bool(value["prompt"].strip())
+            and type(value["seed"]) is int
+            and value["seed"] == 0
+            and type(value["max_new_tokens"]) is int
+            and 1 <= value["max_new_tokens"] <= 64,
+            "Invalid generation contract",
         )
-        names.add(name)
-        scripts.add(script)
+    else:
+        operators = task.get("operators")
+        require(type(operators) is list and operators, "Empty operator task")
+        names, scripts = set(), set()
+        for entry in operators:
+            require(
+                type(entry) is dict and set(entry) == {"name", "script"},
+                "Invalid operator registration",
+            )
+            name, script = entry["name"], entry["script"]
+            require(
+                type(name) is str and re.fullmatch(r"[a-z][a-z0-9_]*", name),
+                "Invalid operator name",
+            )
+            require(
+                type(script) is str
+                and re.fullmatch(
+                    r"tokenspeed-kernel/test/npu/ops/test_[a-z0-9_]+\.py", script
+                ),
+                "Invalid test entry path",
+            )
+            require(
+                name not in names and script not in scripts,
+                "Duplicate operator or script",
+            )
+            names.add(name)
+            scripts.add(script)
     require(task.get("runner") == "ascend-npu-ops-test", "Unsupported runner")
     report = task.get("report", {})
     require(
@@ -1130,7 +1240,9 @@ def read_frozen(root, task, work, expected_digest):
 SCHEMA = 2
 
 
-RUN_NAME = re.compile(r"actions-([0-9]+)-([0-9]+)\.[A-Za-z0-9_]+")
+RUN_NAME = re.compile(
+    r"actions-([0-9]+)-([0-9]+)(?:-([a-z][a-z0-9-]+))?\.[A-Za-z0-9_]+"
+)
 
 
 PHASE_FILES = {"context.json", "report.json", "summary.md", "executor-error.log"}
@@ -1170,8 +1282,25 @@ def utc(timestamp):
 
 def load_policy(path):
     deployment = read_json(path)
-    task = load_task(deployment["task_path"])
-    policy = dict(deployment, **task["report"], **task["cleanup"])
+    paths = (
+        deployment["task_paths"]
+        if "task_paths" in deployment
+        else {CONFIG_PATH: deployment["task_path"]}
+    )
+    require(
+        type(paths) is dict and CONFIG_PATH in paths and set(paths).issubset(TASKS),
+        "Invalid deployed tasks",
+    )
+    task = load_task(paths[CONFIG_PATH])
+    for config, deployed in paths.items():
+        candidate = load_task(deployed)
+        require(config_path(candidate) == config, "Deployed config identity mismatch")
+        require(
+            candidate["report"] == task["report"]
+            and candidate["cleanup"] == task["cleanup"],
+            "Archive policies must agree across tasks",
+        )
+    policy = dict(deployment, task_paths=paths, **task["report"], **task["cleanup"])
     require(
         policy.get("schema_version") == 1 and policy.get("delete_unarchived") is False,
         "Unarchived deletion is not permitted",
@@ -1269,9 +1398,11 @@ def checked_work(policy, path):
         "Run policy mismatch",
     )
     require(
-        [state["run_id"], state["attempt"]] == list(match.groups()),
+        [state["run_id"], state["attempt"]] == list(match.groups()[:2]),
         "Run identity mismatch",
     )
+    require(state.get("task_name") == match.group(3), "Work task tag mismatch")
+    task_phases(state)
     require(state["work"] == str(work), "Work identity mismatch")
     return work, state
 
@@ -1281,6 +1412,7 @@ def initialize(policy, identity, owner, now):
         identity["repository"] == policy["repository"],
         "Repository does not match host policy",
     )
+    task_phases(identity)
     for name in ("run_id", "attempt"):
         require(re.fullmatch(r"[0-9]+", identity[name]), f"Invalid {name}")
     require(re.fullmatch(r"[0-9a-f]{40}", identity["sha"]), "Invalid event SHA")
@@ -1290,7 +1422,7 @@ def initialize(policy, identity, owner, now):
     )
     work = Path(
         tempfile.mkdtemp(
-            prefix=f"actions-{identity['run_id']}-{identity['attempt']}.",
+            prefix=f"actions-{run_key(identity)}.",
             dir=policy["jobs_root"],
         )
     )
@@ -1302,8 +1434,8 @@ def initialize(policy, identity, owner, now):
 
 
 def phase_state(policy, work, phase, stage, rc, now):
-    require(phase in ("accuracy", "performance"), "Unknown phase")
     work, state = checked_work(policy, work)
+    require(phase in task_phases(state), "Unknown task phase")
     state["phases"][phase] = {"stage": stage, "exit": rc, "at": now}
     write_json(work / "lifecycle.json", state)
 
@@ -1336,24 +1468,24 @@ def digest(path):
 
 
 def evidence_directory(policy, state):
-    return Path(policy["evidence_root"]) / f"{state['run_id']}-{state['attempt']}"
+    return Path(policy["evidence_root"]) / run_key(state)
 
 
 def collect(policy, work, now, outcomes):
     work, state = checked_work(policy, work)
-    for directory in (
-        work / "accuracy",
-        work / "performance",
-        work / "plan-collection",
-        work,
-    ):
+    producers = list(work.glob("*.owner.json"))
+    for name in (*task_phases(state), "plan-collection"):
+        directory = work / name
         if directory.exists():
-            for record in directory.rglob("*.owner.json"):
-                for identity in read_json(record).values():
-                    require(
-                        owner_status(identity) == "gone",
-                        "Evidence producer is still active; refusing collection",
-                    )
+            producers.extend(directory.rglob("*.owner.json"))
+    for record in producers:
+        if record.name == "bootstrap.owner.json":
+            continue
+        for identity in read_json(record).values():
+            require(
+                owner_status(identity) == "gone",
+                "Evidence producer is still active; refusing collection",
+            )
     logger = work / "bootstrap.owner.json"
     if logger.exists():
         require(
@@ -1370,10 +1502,18 @@ def collect(policy, work, now, outcomes):
     temporary = Path(tempfile.mkdtemp(prefix=".bundle-", dir=output))
     try:
         selected = []
-        require(set(outcomes) == {"accuracy", "performance"}, "Missing step outcomes")
+        phases = task_phases(state)
+        require(
+            type(outcomes) is dict
+            and set(outcomes) == set(phases)
+            and all(
+                value in ("success", "failure", "skipped", "cancelled")
+                for value in outcomes.values()
+            ),
+            "Missing or invalid step outcomes",
+        )
         succeeded = all(value == "success" for value in outcomes.values()) and all(
-            state["phases"].get(phase, {}).get("exit") == 0
-            for phase in ("accuracy", "performance")
+            state["phases"].get(phase, {}).get("exit") == 0 for phase in phases
         )
         for name in (
             ()
@@ -1395,10 +1535,21 @@ def collect(policy, work, now, outcomes):
                     not (work / name).is_symlink(), "Evidence must not contain symlinks"
                 )
                 selected.append(work / name)
-        for phase in ("accuracy", "performance"):
+        for phase in phases:
             directory = work / phase
             if state["phases"].get(phase, {}).get("exit") == 0:
-                for name in ("context.json", "report.json", "summary.md"):
+                mandatory = ["context.json", "report.json", "summary.md"]
+                if phase == "runtime":
+                    mandatory.append("install-evidence.json")
+                elif phase == "model":
+                    mandatory.extend(
+                        [
+                            "inference/result.json",
+                            "model-manifest.json",
+                            "admission.json",
+                        ]
+                    )
+                for name in mandatory:
                     require(
                         (directory / name).is_file(),
                         f"Required phase evidence missing: {phase}/{name}",
@@ -1407,6 +1558,57 @@ def collect(policy, work, now, outcomes):
                 continue
             require(directory == directory.resolve(), "Invalid phase directory")
             for path in regular_files(directory):
+                if phase in ("runtime", "model"):
+                    allowed = {
+                        "context.json",
+                        "report.json",
+                        "summary.md",
+                        "install-evidence.json",
+                        "model-manifest.json",
+                        "result.json",
+                        "constraints.txt",
+                        "pip-check.log",
+                        "runtime-install.log",
+                        "build-tools.log",
+                        "base-install.log",
+                        "venv.log",
+                        "install-provenance.log",
+                        "pip-report.json",
+                        "model.log",
+                        "model.owner.json",
+                        "model.exit.json",
+                        "admission.json",
+                        "executor-error.log",
+                    }
+                    allowed.update(
+                        f"{stem}.{kind}.json"
+                        for stem in (
+                            "venv",
+                            "base-install",
+                            "build-tools",
+                            "runtime-install",
+                            "pip-check",
+                            "install-provenance",
+                        )
+                        for kind in ("owner", "exit")
+                    )
+                    if path.name in allowed and (
+                        not succeeded
+                        or path.name
+                        in {
+                            "context.json",
+                            "report.json",
+                            "summary.md",
+                            "install-evidence.json",
+                            "pip-report.json",
+                            "constraints.txt",
+                            "model-manifest.json",
+                            "admission.json",
+                            "result.json",
+                        }
+                    ):
+                        selected.append(path)
+                    continue
                 if succeeded and path.name not in ("context.json", "summary.md"):
                     continue
                 relative = path.relative_to(directory)
@@ -1451,8 +1653,12 @@ def collect(policy, work, now, outcomes):
                     "runner",
                     "started_at",
                     "phases",
+                    "task_name",
+                    "task_config",
                 )
-            },
+                if key in state
+            }
+            | {"step_outcomes": outcomes},
         )
         entries.append(
             {
@@ -1520,9 +1726,7 @@ def remove_directory(path, parent):
     shutil.rmtree(path)
 
 
-def acknowledge(
-    policy, work, outcome, artifact_id, artifact_digest, accuracy, performance, now
-):
+def acknowledge(policy, work, outcome, artifact_id, artifact_digest, outcomes, now):
     work, state = checked_work(policy, work)
     output = evidence_directory(policy, state)
     require(
@@ -1530,6 +1734,10 @@ def acknowledge(
         "Evidence collection did not finish",
     )
     verify_bundle(output / "bundle")
+    require(
+        outcomes == read_json(output / "bundle/run.json")["step_outcomes"],
+        "Archive step outcomes mismatch",
+    )
     uploaded = (
         outcome == "success"
         and bool(re.fullmatch(r"[0-9]+", artifact_id))
@@ -1539,8 +1747,7 @@ def acknowledge(
         "schema": SCHEMA,
         "uploaded": uploaded,
         "at": now,
-        "accuracy": accuracy,
-        "performance": performance,
+        "outcomes": outcomes,
         "artifact_id": artifact_id,
         "artifact_digest": artifact_digest,
         "work_removed": False,
@@ -1555,13 +1762,15 @@ def acknowledge(
     write_json(output / "receipt.json", receipt)
     # Preserve the minimal receipt outside the disposable evidence directory.
     write_json(
-        Path(policy["state_root"]) / f"{state['run_id']}-{state['attempt']}.json",
+        Path(policy["state_root"]) / f"{run_key(state)}.json",
         dict(
             receipt,
             repository=state["repository"],
             sha=state["sha"],
             run_id=state["run_id"],
             attempt=state["attempt"],
+            task_name=state.get("task_name"),
+            task_config=state.get("task_config"),
         ),
     )
     remove_directory(output, policy["evidence_root"])
@@ -1698,23 +1907,25 @@ def lifecycle_cli(argv):
     commands.add_parser("init")
     phase = commands.add_parser("phase")
     phase.add_argument("--work", required=True)
-    phase.add_argument("--phase", choices=("accuracy", "performance"), required=True)
+    phase.add_argument(
+        "--phase",
+        choices=("accuracy", "performance", "runtime", "model"),
+        required=True,
+    )
     phase.add_argument("--stage", required=True)
     phase.add_argument("--exit", type=int, required=True)
     logger = commands.add_parser("log")
     logger.add_argument("--work", required=True)
     collector = commands.add_parser("collect")
     collector.add_argument("--work", required=True)
-    collector.add_argument("--accuracy", required=True)
-    collector.add_argument("--performance", required=True)
+    collector.add_argument("--outcomes", required=True)
     ack = commands.add_parser("ack")
     for name in (
         "work",
         "outcome",
         "artifact-id",
         "artifact-digest",
-        "accuracy",
-        "performance",
+        "outcomes",
     ):
         ack.add_argument(f"--{name}", required=True)
     gc = commands.add_parser("gc")
@@ -1748,7 +1959,10 @@ def lifecycle_cli(argv):
         print(work)
     elif args.command == "phase":
         phase_state(policy, args.work, args.phase, args.stage, args.exit, now)
-        if args.phase == "accuracy" and (Path(args.work) / "fetch.tsv").exists():
+        if (
+            args.phase in ("accuracy", "runtime")
+            and (Path(args.work) / "fetch.tsv").exists()
+        ):
             with (Path(args.work) / "fetch.tsv").open() as handle:
                 rows = list(csv.reader(handle, delimiter="\t"))
             append_summary(
@@ -1766,7 +1980,7 @@ def lifecycle_cli(argv):
             policy,
             args.work,
             now,
-            {"accuracy": args.accuracy, "performance": args.performance},
+            decode_record(args.outcomes),
         )
         with Path(os.environ["GITHUB_OUTPUT"]).open("a") as handle:
             handle.write(
@@ -1789,13 +2003,12 @@ def lifecycle_cli(argv):
             args.outcome,
             args.artifact_id,
             args.artifact_digest,
-            args.accuracy,
-            args.performance,
+            decode_record(args.outcomes),
             now,
         )
         link = f"https://github.com/{policy['repository']}/actions/runs/{os.environ['GITHUB_RUN_ID']}/artifacts/{args.artifact_id}"
         append_summary(
-            f"\n### Evidence archive\n\nAccuracy: `{args.accuracy}`; performance: `{args.performance}`.\n\nUpload confirmed: `{receipt['uploaded']}`; work directory removed: `{receipt['work_removed']}`.\n"
+            f"\n### Evidence archive\n\nStep outcomes: `{args.outcomes}`.\n\nUpload confirmed: `{receipt['uploaded']}`; work directory removed: `{receipt['work_removed']}`.\n"
             + (
                 f"\n[Download evidence]({link})\n\nSHA-256: `{args.artifact_digest}`\n"
                 if receipt["uploaded"]
@@ -2496,6 +2709,12 @@ def run_task(work, mode):
         ).strip(),
         "Checkout contains modified or untracked files",
     )
+    if (work / "lifecycle.json").exists():
+        require(
+            task_phases(read_json(work / "lifecycle.json"))
+            == ("accuracy", "performance"),
+            "Operator command received a different task",
+        )
     task = load_task(root / CONFIG_PATH)
     os.environ["NPU_ENVIRONMENT_ENTRY"] = str(NPU_ENVIRONMENT)
     os.environ["NPU_ENVIRONMENT_SHA256"] = file_digest(NPU_ENVIRONMENT)
@@ -2567,6 +2786,534 @@ def run_task(work, mode):
     return 0
 
 
+# Model runtime installation and one native generation
+
+MODEL_PROJECTS = {
+    "tokenspeed": "python",
+    "tokenspeed-scheduler": "tokenspeed-scheduler",
+    "tokenspeed-kernel": "tokenspeed-kernel/python",
+    "tokenspeed-kernel-npu": "tokenspeed-kernel-npu",
+}
+MODEL_BASE = [
+    "torch==2.9.0+cpu",
+    "torch-npu==2.9.0.post2",
+    "triton-ascend==3.2.1",
+    "numpy==1.26.4",
+    "transformers==5.12.0",
+    "apache-tvm-ffi==0.1.13.post3",
+]
+
+
+def model_context(work, clean):
+    import platform
+    import pwd
+
+    work = Path(work).resolve(strict=True)
+    root = work / "checkout"
+    require(
+        platform.system() == "Linux" and platform.machine() == "aarch64",
+        "Linux ARM64 is required",
+    )
+    require(
+        pwd.getpwuid(os.geteuid()).pw_name == "ci-npu", "The ci-npu account is required"
+    )
+    source = read_json(work / "source.json")
+    require(
+        source["task_config"] == MODEL_CONFIG_PATH
+        and source["task_name"] == TASKS[MODEL_CONFIG_PATH][0],
+        "This directory does not belong to the model task",
+    )
+    actual = subprocess.check_output(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+    ).strip()
+    require(
+        actual
+        == source["sha"]
+        == os.environ.get("NPU_CHECKOUT_REF", os.environ.get("GITHUB_SHA")),
+        "Model checkout SHA mismatch",
+    )
+    command = (
+        ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"]
+        if clean
+        else ["git", "-C", str(root), "diff", "--name-only", "HEAD", "--"]
+    )
+    require(
+        not subprocess.check_output(command, text=True).strip(),
+        "Model checkout contains source changes",
+    )
+    task = load_task(root / MODEL_CONFIG_PATH)
+    entry = root / task["script"]
+    require(
+        entry.is_file()
+        and not entry.is_symlink()
+        and entry.resolve().is_relative_to(root),
+        "Selected model entry is missing or unsafe",
+    )
+    return work, root, source, task
+
+
+def model_environment(work):
+    environment = subprocess.check_output(
+        [
+            "bash",
+            "-c",
+            'set -e; source "$1" >/dev/null; source "$ASCEND_HOME_PATH/share/info/ascendnpu-ir/bin/set_env.sh" >/dev/null; env -0',
+            "npu-model-env",
+            str(NPU_ENVIRONMENT),
+        ]
+    )
+    for item in environment.split(b"\0"):
+        if b"=" in item:
+            key, value = os.fsdecode(item).split("=", 1)
+            os.environ[key] = value
+    # CANN native libraries/IR are retained; profiler Python distributions are
+    # excluded from the independently resolved inference environment.
+    for name in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "TORCH_TRANSFER_TO_NPU",
+        "PIP_NO_INDEX",
+        "PIP_INDEX_URL",
+        "PIP_EXTRA_INDEX_URL",
+        "PIP_CONSTRAINT",
+    ):
+        os.environ.pop(name, None)
+    for name, relative in {
+        "TMPDIR": "tmp",
+        "XDG_CACHE_HOME": "cache",
+        "TRITON_CACHE_DIR": "cache/triton",
+        "TVM_FFI_CACHE_DIR": "cache/tvm",
+        "TORCH_EXTENSIONS_DIR": "cache/torch",
+        "TORCH_HOME": "cache/torch-home",
+        "HF_HOME": "cache/huggingface",
+        "MODELSCOPE_CACHE": "cache/modelscope",
+    }.items():
+        path = work / relative
+        path.mkdir(parents=True, exist_ok=True)
+        os.environ[name] = str(path)
+    venv = work / "model-venv"
+    os.environ.update(
+        VIRTUAL_ENV=str(venv),
+        PATH=f"{venv / 'bin'}{os.pathsep}{os.environ['PATH']}",
+        PIP_CONFIG_FILE="/dev/null",
+        PIP_REQUIRE_VIRTUALENV="1",
+        PYTHONNOUSERSITE="1",
+        PYTHONDONTWRITEBYTECODE="1",
+        PYTHONUNBUFFERED="1",
+        ASCEND_RT_VISIBLE_DEVICES="0",
+        TOKENSPEED_KERNEL_BACKEND="npu",
+    )
+    return venv / "bin/python"
+
+
+def model_phase_report(directory, phase, source, status, details):
+    report = {
+        "schema_version": 1,
+        "phase": phase,
+        "status": status,
+        "source_sha": source["sha"],
+        "task": source["task_name"],
+        **details,
+    }
+    write_json(directory / "report.json", report)
+    summary = (
+        f"## Ascend NPU {phase}\n\nStatus: `{status}`; source: `{source['sha']}`.\n\n"
+    )
+    summary += "\n".join(
+        f"- {key}: {_md_cell(value)}"
+        for key, value in details.items()
+        if key in ("error", "model_id", "generated_tokens", "decoded_output")
+    )
+    summary += "\n\nModel smoke checks execution and bounded nonempty output. Accuracy and performance thresholds are not evaluated.\n"
+    save_text(directory / "summary.md", summary)
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        append_summary(summary)
+
+
+def prepare_model_runtime(work, policy_path):
+    import tomllib
+
+    work, root, source, task = model_context(work, clean=True)
+    policy = load_policy(policy_path)
+    _, owner = checked_work(policy, work)
+    require(owner["task_config"] == MODEL_CONFIG_PATH, "Model owner mismatch")
+    directory = work / "runtime"
+    directory.mkdir()
+    started = time.monotonic()
+    write_json(directory / "context.json", {"source": source, "task": task})
+    try:
+        model = task["model"]
+        deployment = policy["models"][model["id"]]
+        require(
+            deployment["revision"] == model["revision"]
+            and deployment["manifest_sha256"] == model["manifest_sha256"],
+            "Deployed model identity mismatch",
+        )
+        path = Path(deployment["path"])
+        require(
+            path.is_absolute()
+            and path == path.resolve()
+            and path.is_dir()
+            and path.stat().st_uid == 0
+            and not path.stat().st_mode & 0o222,
+            "Readonly deployed model missing",
+        )
+        require(
+            digest(path / "model-manifest.json") == model["manifest_sha256"],
+            "Deployed model manifest mismatch",
+        )
+        write_json(work / "model-deployment.json", deployment)
+        build = policy["model_runtime"]
+        for key in ("python", "wheels", "openssl_root"):
+            require(
+                Path(build[key]).is_absolute() and Path(build[key]).exists(),
+                f"Missing model build dependency: {key}",
+            )
+        python = model_environment(work)
+        write_json(
+            directory / "context.json",
+            {
+                "source": source,
+                "task": task,
+                "environment_entry": str(NPU_ENVIRONMENT),
+                "environment_sha256": digest(NPU_ENVIRONMENT),
+                "ir_entry": str(
+                    Path(os.environ["ASCEND_HOME_PATH"])
+                    / "share/info/ascendnpu-ir/bin/set_env.sh"
+                ),
+                "ir_sha256": digest(
+                    Path(os.environ["ASCEND_HOME_PATH"])
+                    / "share/info/ascendnpu-ir/bin/set_env.sh"
+                ),
+            },
+        )
+        os.environ["TOKENSPEED_KERNEL_GIT_SHA"] = source["sha"]
+        os.environ["TOKENSPEED_KERNEL_GIT_BRANCH"] = "ci/npu"
+        os.environ["TOKENSPEED_KERNEL_NIGHTLY"] = "false"
+        os.environ["TOKENSPEED_CI_SOURCE_SHA"] = source["sha"]
+        os.environ["CMAKE_ARGS"] = f"-DOPENSSL_ROOT_DIR={build['openssl_root']}"
+        os.environ["CMAKE_BUILD_PARALLEL_LEVEL"] = "4"
+        constraints = directory / "constraints.txt"
+        save_text(constraints, "\n".join(MODEL_BASE + ["triton==3.5.0"]) + "\n")
+        os.environ["PIP_CONSTRAINT"] = str(constraints)
+        build_requirements = set()
+        for relative in MODEL_PROJECTS.values():
+            with (root / relative / "pyproject.toml").open("rb") as handle:
+                build_requirements.update(
+                    tomllib.load(handle)["build-system"]["requires"]
+                )
+        commands = [
+            ("venv.log", [build["python"], "-m", "venv", str(work / "model-venv")]),
+            (
+                "base-install.log",
+                [
+                    str(python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-index",
+                    "--find-links",
+                    build["wheels"],
+                    *MODEL_BASE,
+                ],
+            ),
+            (
+                "build-tools.log",
+                [
+                    str(python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--timeout",
+                    "15",
+                    "--retries",
+                    "1",
+                    "--index-url",
+                    "https://pypi.org/simple",
+                    *sorted(build_requirements),
+                ],
+            ),
+            (
+                "runtime-install.log",
+                [
+                    str(python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-build-isolation",
+                    "--timeout",
+                    "15",
+                    "--retries",
+                    "1",
+                    "--index-url",
+                    "https://pypi.org/simple",
+                    "--find-links",
+                    build["wheels"],
+                    "--report",
+                    str(directory / "pip-report.json"),
+                    *[str(root / p) for p in MODEL_PROJECTS.values()],
+                ],
+            ),
+            (
+                "install-provenance.log",
+                [
+                    str(python),
+                    "-B",
+                    str(root / "test/ci_system/npu/pipeline.py"),
+                    "model-install-proof",
+                    "--work",
+                    str(work),
+                ],
+            ),
+        ]
+        for name, command in commands:
+            remaining = task["timeouts"]["runtime_install_seconds"] - (
+                time.monotonic() - started
+            )
+            require(remaining > 0, "Model runtime installation deadline exceeded")
+            captured = capture_test(command, root, directory / name, remaining)
+            require(
+                captured["exit_code"] == 0
+                and captured["log_saved"]
+                and not captured["capture_error"],
+                f"Model runtime command failed: {name}; {captured}",
+            )
+        model_phase_report(
+            directory,
+            "runtime",
+            source,
+            "passed",
+            {
+                "model_id": model["id"],
+                "installation": "current-source",
+                "pip_check_passed": True,
+            },
+        )
+        return 0
+    except BaseException as exc:
+        save_text(directory / "executor-error.log", traceback.format_exc())
+        model_phase_report(
+            directory,
+            "runtime",
+            source,
+            "failed",
+            {"error": f"{type(exc).__name__}: {exc}"},
+        )
+        raise
+
+
+def record_model_install(work):
+    work, root, source, task = model_context(work, clean=False)
+    prefix = (work / "model-venv").resolve(strict=True)
+    require(
+        Path(sys.prefix).resolve() == prefix, "Expected this job's model virtualenv"
+    )
+    checked = subprocess.run(
+        [sys.executable, "-m", "pip", "check"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    save_text(work / "runtime/pip-check.log", checked.stdout + checked.stderr)
+    require(checked.returncode == 0, "Model pip check failed")
+    installed = {}
+    for name, relative in MODEL_PROJECTS.items():
+        distribution = importlib.metadata.distribution(name)
+        direct_url = json.loads(distribution.read_text("direct_url.json"))
+        require(
+            direct_url["url"] == (root / relative).as_uri(),
+            f"Installed component did not come from current checkout: {name}",
+        )
+        item = {"version": distribution.version, "direct_url": direct_url}
+        if name == "tokenspeed-kernel":
+            require(
+                f"git{source['sha'][:8]}" in distribution.version,
+                "Kernel package SHA mismatch",
+            )
+        if name == "tokenspeed-scheduler":
+            import tokenspeed_scheduler.tokenspeed_scheduler_ext as extension
+
+            binary = Path(extension.__file__).resolve(strict=True)
+            require(
+                binary.is_relative_to(prefix), "Scheduler binary is outside this job"
+            )
+            libraries = subprocess.check_output(["ldd", str(binary)], text=True)
+            require(
+                "not found" not in libraries, "Scheduler binary has missing libraries"
+            )
+            item["binary"] = {
+                "path": str(binary),
+                "sha256": digest(binary),
+                "ldd": libraries,
+            }
+        installed[name] = item
+    evidence = {
+        "schema_version": 1,
+        "components": "full-runtime",
+        "source_sha": source["sha"],
+        "source_root": str(root),
+        "pip_check_passed": True,
+        "installed": installed,
+        "source_hashes": {
+            relative: digest(root / relative / "pyproject.toml")
+            for relative in MODEL_PROJECTS.values()
+        },
+        "pip_report_sha256": digest(work / "runtime/pip-report.json"),
+    }
+    write_json(work / "runtime/install-evidence.json", evidence)
+    print(json.dumps(evidence, indent=2), flush=True)
+    return 0
+
+
+def run_model(work):
+    import fcntl
+    import socket
+
+    work, root, source, task = model_context(work, clean=False)
+    require(
+        read_json(work / "lifecycle.json")["phases"].get("runtime", {}).get("exit")
+        == 0,
+        "Model runtime step did not succeed; generation is blocked",
+    )
+    python = model_environment(work)
+    os.environ["TOKENSPEED_CI_SOURCE_SHA"] = source["sha"]
+    directory = work / "model"
+    directory.mkdir()
+    model = task["model"]
+    deployment = read_json(work / "model-deployment.json")
+    write_json(
+        directory / "context.json",
+        {"source": source, "task": task, "deployment": deployment},
+    )
+    save_text(
+        directory / "model-manifest.json",
+        (Path(deployment["path"]) / "model-manifest.json").read_text(),
+    )
+    lock = os.open("/srv/npu-ci/locks/host-all.lock", os.O_RDWR | os.O_NOFOLLOW)
+    os.dup2(lock, 9, inheritable=True)
+    if lock != 9:
+        os.close(lock)
+    try:
+        started = time.monotonic()
+        print(
+            f"Waiting for host lock: limit={task['timeouts']['lock_wait_seconds']}s",
+            flush=True,
+        )
+        while True:
+            try:
+                fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                require(
+                    time.monotonic() - started < task["timeouts"]["lock_wait_seconds"],
+                    "Host lock wait timed out; model was not started",
+                )
+                time.sleep(0.1)
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        write_json(
+            directory / "admission.json",
+            {"lock_wait_seconds": time.monotonic() - started, "port": port},
+        )
+        print("Host lock acquired; starting model smoke", flush=True)
+        command = [
+            str(python),
+            "-B",
+            str(root / task["script"]),
+            "--source-root",
+            str(root),
+            "--source-sha",
+            source["sha"],
+            "--install-evidence",
+            str(work / "runtime/install-evidence.json"),
+            "--model",
+            deployment["path"],
+            "--model-id",
+            model["id"],
+            "--model-revision",
+            model["revision"],
+            "--manifest-sha256",
+            model["manifest_sha256"],
+            "--dtype",
+            model["dtype"],
+            "--sampling-backend",
+            model["sampling_backend"],
+            "--temperature",
+            str(model["temperature"]),
+            "--device",
+            model["device"],
+            "--device-count",
+            str(model["device_count"]),
+            "--tp-size",
+            str(model["tp_size"]),
+            "--dp-size",
+            str(model["dp_size"]),
+            "--pp-size",
+            str(model["pp_size"]),
+            "--prompt",
+            model["prompt"],
+            "--max-new-tokens",
+            str(model["max_new_tokens"]),
+            "--seed",
+            str(model["seed"]),
+            "--port",
+            str(port),
+            "--output-dir",
+            str(directory / "inference"),
+        ]
+        captured = capture_test(
+            command,
+            root,
+            directory / "model.log",
+            task["timeouts"]["phase_execution_seconds"],
+        )
+        require(
+            captured["exit_code"] == 0
+            and captured.get("process_exit_code") == 0
+            and captured["log_saved"]
+            and not captured["capture_error"],
+            f"Model process failed: {captured}",
+        )
+        result = read_json(directory / "inference/result.json")
+        require(
+            result["status"] == "passed"
+            and result["source_sha"] == source["sha"]
+            and result["model_manifest_sha256"] == model["manifest_sha256"],
+            "Model result identity/status mismatch",
+        )
+        require(
+            1 <= len(result["output_ids"]) <= model["max_new_tokens"]
+            and bool(result["decoded_output"].strip()),
+            "Model returned invalid output",
+        )
+        model_phase_report(
+            directory,
+            "model",
+            source,
+            "passed",
+            {
+                "model_id": model["id"],
+                "generated_tokens": len(result["output_ids"]),
+                "decoded_output": result["decoded_output"],
+                "verdict": "smoke_only",
+            },
+        )
+        return 0
+    except BaseException as exc:
+        save_text(directory / "executor-error.log", traceback.format_exc())
+        model_phase_report(
+            directory,
+            "model",
+            source,
+            "failed",
+            {"error": f"{type(exc).__name__}: {exc}"},
+        )
+        raise
+    finally:
+        os.close(9)
+
+
 def fetch_source(work, repository, sha):
     checkout = work / "checkout"
     for attempt in range(1, 5):
@@ -2627,6 +3374,7 @@ def prepare_task(argv):
     parser.add_argument("--config", required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--runner", required=True)
+    parser.add_argument("--type", choices=("ut", "model_smoke"), required=True)
     parser.add_argument("--timeout-minutes", type=int, required=True)
     args = parser.parse_args(argv)
     policy = load_policy(args.policy)
@@ -2665,12 +3413,22 @@ def prepare_task(argv):
             ("runner", "RUNNER_NAME"),
         )
     }
+    require(args.config in policy["task_paths"], "Unsupported deployed task config")
+    trusted_task = load_task(policy["task_paths"][args.config])
+    require(
+        trusted_task["name"] == args.name
+        and trusted_task["runner"] == args.runner
+        and trusted_task["type"] == args.type
+        and trusted_task["timeouts"]["job_minutes"] == args.timeout_minutes,
+        "Matrix identity does not match deployed task",
+    )
+    identity.update(task_name=trusted_task["name"], task_config=args.config)
     work = initialize(policy, identity, worker_identity(), time.time())
     with Path(os.environ["GITHUB_ENV"]).open("a") as output:
         output.write(f"NPU_CI_WORK={work}\n")
     checkout = work / "checkout"
     try:
-        require(args.config == CONFIG_PATH, "Unsupported task config")
+        require(args.config in TASKS, "Unsupported task config")
         prepared = capture_test(
             ["git", "init", "-q", str(checkout)], work, work / "init.log", 30
         )
@@ -2713,11 +3471,11 @@ def prepare_task(argv):
             "Host pipeline runtime does not match selected source",
         )
         require(
-            Path(policy["task_path"]).read_bytes()
-            == (checkout / CONFIG_PATH).read_bytes(),
+            Path(policy["task_paths"][args.config]).read_bytes()
+            == (checkout / args.config).read_bytes(),
             "Host task policy does not match selected source",
         )
-        task = load_task(checkout / CONFIG_PATH)
+        task = load_task(checkout / args.config)
         require(
             task["name"] == args.name and task["runner"] == args.runner,
             "Matrix identity does not match task",
@@ -2748,6 +3506,17 @@ def main(argv=None):
         )
         args = parser.parse_args(argv[1:])
         return run_task(args.work, args.mode)
+    if argv and argv[0] in ("model-runtime", "model-install-proof", "model"):
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--work", required=True)
+        if argv[0] == "model-runtime":
+            parser.add_argument("--policy", required=True)
+        args = parser.parse_args(argv[1:])
+        if argv[0] == "model-runtime":
+            return prepare_model_runtime(args.work, args.policy)
+        if argv[0] == "model-install-proof":
+            return record_model_install(args.work)
+        return run_model(args.work)
     if argv and argv[0] == "lifecycle":
         return lifecycle_cli(argv[1:])
     return phase_main(argv)

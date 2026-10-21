@@ -1,24 +1,20 @@
-# ARM Ascend NPU operator CI
+# ARM Ascend NPU operator and model CI
 
 ## Workflow contract
 
 `pr-test-ascendnpu-arm.yml` handles main pushes, main pull requests and manual
-runs. It uses the complete GitHub API change list to select the suite and emits
-an `include` matrix, an exact `checkout_ref` SHA and `timeout_minutes`. Unrelated
-changes, draft PRs and disabled hardware skip the reusable call before requesting
-a hardware runner. Incomplete or stale API results fail selection.
+runs. One complete GitHub API change list selects operator and model tasks
+separately. Each selected stage calls `run-ci-task-matrix-npu.yml` with a matrix,
+an exact `checkout_ref` SHA and `timeout_minutes`. Incomplete or stale API results
+fail selection. Draft PRs and disabled hardware skip runner allocation.
 
-`run-ci-task-matrix-npu.yml` accepts those three required `workflow_call` inputs.
-It expands the matrix once, with `max-parallel: 1` and `fail-fast: true`. The current
-matrix contains one `ut-tokenspeed-kernel-npu` suite on `ascend-npu-ops-test`, not
-one item per operator or phase. Runner identity variables are explicitly read
-from repository variables in the callee. Only the caller has PR concurrency;
-the callee does not reuse that group or cancel its own caller.
-
-The same job prepares exact sources, runs **all accuracy** tests, then **all
-performance** tests. Any required test, configuration, log or report failure
-stops subsequent tests. Performance is skipped after accuracy failure. Official
-Artifact uploads and final cleanup cannot override a failed test result.
+The reusable workflow has `max-parallel: 1` and `fail-fast: true`. The operator
+suite runs all accuracy tests before all performance tests. The independent
+`qwen-npu-smoke` job prepares its runtime and generates one bounded response.
+When both tasks are selected, operators run first; failure or cancellation blocks
+the model. A model-only change allows the operator job to be skipped.
+Any required test, configuration, log or report failure stops subsequent tests.
+Artifact upload and cleanup preserve the preceding failure result.
 
 Repository variables:
 
@@ -26,14 +22,19 @@ Repository variables:
   repository is also recognized by the entry workflow.
 - `TOKENSPEED_NPU_ARM_CI_ENABLED`: must be `true`; hardware is disabled by default.
 - `TOKENSPEED_NPU_ARM_RUNNER_NAME`: required exact self-hosted runner name.
+- `TOKENSPEED_NPU_ARM_MODEL_CI_ENABLED`: must be `true` for automatic model jobs.
+  It stays unset until model acceptance. A manual dispatch can explicitly set
+  `run_model_validation: true` to validate the model before enabling automatic CI.
 
-Draft PR hardware remains disabled. A manual run on the selected branch is used
-for hardware acceptance without converting the PR to ready.
+Both task types use `ascend-npu-ops-test`. Runner identity variables are read by
+the callee. Only the caller owns the PR concurrency group; the callee cannot
+cancel its caller by sharing that group.
 
 ## Task declaration and tests
 
-`test/ci/npu_test/ut-tokenspeed-kernel-npu.json` is the single source for task
-registration, watched paths, resources, timeout and report/cleanup policy.
+The two JSON task declarations own registration, watched paths, resources,
+timeouts and report/cleanup policy. `ut-tokenspeed-kernel-npu.json` selects the
+operator suite; `qwen-npu-smoke.json` selects the model suite.
 Concrete cases, reference calculations and sample counts live only in the two
 pytest modules under `tokenspeed-kernel/test/npu/ops/`. Add an operator module and
 register its path; do not add operator-name branches to the executor.
@@ -75,6 +76,40 @@ Those numbers describe coverage, not a second manually maintained test plan.
 Performance thresholds are not defined: `performance_verdict=not_evaluated` even
 when every timing sample is complete and valid.
 
+## Offline Qwen smoke
+
+`test/runtime/models/qwen_npu_smoke.py` runs the native NPU engine with one visible
+device, BF16, greedy sampling, seed 0 and TP/DP/PP equal to 1. The task fixes the
+prompt and a maximum of 16 generated tokens. It validates token IDs, finish reason,
+completion count, finite JSON evidence and nonempty decoded text. This is an
+execution smoke check; accuracy and performance thresholds are not evaluated.
+
+The deployment supplies the official `Qwen/Qwen3-0.6B` snapshot at revision
+`c1899de289a04d12100db370d81485cdf75e47ca`. Its complete content manifest has SHA-256
+`5a25b58f54e9e74b4c1dce7f5ef8514bcf4e974afeaf2f5dc39e710250bd2d21`.
+Model files live outside disposable run directories, owned by root and readonly.
+Every model job verifies the fixed manifest and every listed file, then loads
+weights and tokenizer offline with remote code disabled.
+
+`Prepare model runtime` creates a fresh job virtualenv. It installs the reviewed
+NPU wheels and the current projects' declared build requirements, then builds
+TokenSpeed, scheduler and both kernel packages from the exact checkout. Standard
+pip resolves all runtime dependencies and `pip check` must pass. Build isolation
+is disabled after installing the declared build requirements because the kernel
+build invokes pip itself. Dependency resolution remains enabled. The scheduler
+uses the existing OpenSSL development directory from host policy.
+
+The model environment loads CANN native libraries and IR, while excluding CANN
+profiler Python distributions from its Python search path. This gives inference
+its own dependency resolution. The runtime pytest minimum is 8.3.2 to permit the
+reviewed Triton-Ascend version; pytest 9 remains permitted in other environments.
+The operator environment remains independently prepared.
+
+Install evidence verifies local source origins, the checkout SHA, kernel package
+SHA and scheduler binary hash/library loading. The model script checks this
+provenance again and verifies actual native NPU arithmetic before generation.
+All writable build files, virtualenv and caches belong to the current task.
+
 ## Host admission and source preparation
 
 The prepared deployment is Linux ARM64, account `ci-npu`, environment
@@ -83,24 +118,30 @@ Each phase verifies a clean exact checkout, loads CANN/Python, then acquires the
 shared `/srv/npu-ci/locks/host-all.lock` with a bounded wait. Matrix concurrency
 is not a replacement for this cross-runner lock and does not promise FIFO.
 The phase execution budget starts after admission. Current task budgets are
-600 seconds per lock wait, 1800 seconds per phase and 90 minutes per job,
-leaving 10 minutes for preparation and archiving.
+600 seconds per lock wait, 1800 seconds per operator phase and 90 minutes per
+job. The model has a separate 900-second installation deadline and 600-second
+inference deadline. Lock waiting does not consume the inference deadline.
 
 Before sources exist, the workflow uses a root-owned installation of the same
-`pipeline.py` under `/srv/npu-ci/runtime/vm-phase1-v06`. Its `policy.json` contains
-only deployment paths, repository identity, minimum free space and `task_path`.
-That path points to a root-owned copy of the task declaration; artifact policy
-is not duplicated in a separate source file. Installation is an operator action,
+`pipeline.py` under `/srv/npu-ci/runtime/vm-phase1-qwen-v1`. Its `policy.json` contains
+deployment paths, repository identity, minimum free space, `task_paths`, the
+readonly model mapping and model build paths. `task_paths` maps each supported
+config to its root-owned declaration copy; the legacy `task_path` may still
+identify the operator declaration. Archive policies must agree across tasks. Installation is an operator action,
 not a root privilege granted to repository code. Runner user execution cannot
 select arbitrary host deletion roots.
 
-The trusted `prepare` command creates an owned run directory before fetching.
+The trusted `prepare` command validates the matrix identity and creates an owned
+run directory before fetching. Task names are part of work, evidence and receipt
+identities, so two tasks in one Actions run cannot overwrite each other.
 Git fetch makes at most four attempts, separated by 30 seconds, retaining each
 Git error and exit code. Cancellation is not retried. Each download attempt is
 bounded, and a final failure retains bootstrap/fetch diagnostics for archiving.
 It checks the exact checkout SHA and byte equality of the installed pipeline and
 task declaration with the selected source. A source change to either requires
-an explicit reviewed runtime update before hardware execution.
+an explicit reviewed runtime update before hardware execution. The Qwen version
+uses its own runtime and work/evidence/state slot; older validated slots remain
+available to their existing workflows.
 
 Each test subprocess runs in a private process group. A separate supervisor
 holds the shared lock and watches a parent pipe and the owning Runner.Worker
@@ -115,7 +156,8 @@ comes from the task: 7 days retention, 1 GiB maximum bundle size and three uploa
 attempts. The three upload steps temporarily tolerate an attempt failure only
 for retry; final acknowledgement returns failure if every upload failed.
 
-Successful runs upload summaries, context and run identity. Failed runs include
+Successful runs upload summaries, context and run identity. Model runs also
+retain install provenance, model manifest, admission and generation results. Failed runs include
 raw diagnostics, detailed reports and the frozen plan when available. Logs use
 one physical local copy; bundle selection hardlinks files on the same filesystem.
 Active producers and symlinks are rejected. Manifests and hashes are checked
@@ -126,11 +168,11 @@ Only after successful upload acknowledgement are this run's checkout, cache,
 temporary files, logs and bundle removed. Upload failure retains the only local
 evidence. The separate report-only timer warns after 24 hours and waits for
 manual handling; it never deletes unarchived evidence. Historical directories,
-prepared environments and existing runners are preserved. No cross-run source or
-compilation cache is implemented.
+prepared environments, readonly model files and existing runners are preserved.
+No cross-run source or compilation cache is implemented.
 
 Infrastructure regression scripts are maintained outside the formal source
-patch. Model, nightly, K3s and branch-protection work are outside this operator
-subset. Acceptance must name the new commit and distinguish GitHub logs/artifact
+patch. Nightly, K3s and branch-protection work remain separate.
+Acceptance must name the new commit and distinguish GitHub logs/artifact
 from the independently read VM receipt; cleaned VM raw logs cannot be claimed as
 still available for a line-by-line comparison.
