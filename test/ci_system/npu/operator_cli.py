@@ -21,15 +21,21 @@
 """Explicit mode selection shared by standalone operator test scripts."""
 
 import argparse
+import json
 from collections.abc import Callable
 
 
-def parse_mode(argv, description: str) -> str:
+def parse_mode(argv, description: str):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--mode", choices=("accuracy", "performance", "all"), required=True
     )
-    return parser.parse_args(argv).mode
+    parser.add_argument(
+        "--collect-plan",
+        action="store_true",
+        help="Print the plan without loading device libraries",
+    )
+    return parser.parse_args(argv)
 
 
 def run_modes(
@@ -50,3 +56,26 @@ def run_modes(
         if result != 0:
             return result
     return 0
+
+
+def emit_plan(
+    operator, cases, configs, timing, accuracy_metadata, performance_metadata
+):
+    """Serialize the same definitions used by execution, without device work."""
+    print(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "operator": operator,
+                "accuracy": [
+                    {"case": c, "metadata": accuracy_metadata(c)} for c in cases
+                ],
+                "performance": [
+                    {"config": c, "metadata": performance_metadata(c)} for c in configs
+                ],
+                "timing": timing,
+            },
+            allow_nan=False,
+            sort_keys=True,
+        )
+    )

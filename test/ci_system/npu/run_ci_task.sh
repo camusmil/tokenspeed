@@ -40,10 +40,26 @@ actual_sha=$(git rev-parse HEAD)
 [[ "$actual_sha" = "$GITHUB_SHA" ]] || { echo "Checkout SHA mismatch: $actual_sha" >&2; exit 1; }
 status=$(git status --porcelain --untracked-files=all)
 [[ -z "$status" ]] || { echo 'Checkout contains modified or untracked files' >&2; exit 1; }
-echo 'Acquiring host lock: /srv/npu-ci/locks/host-all.lock'
+python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
+[[ "$(id -un)" = ci-npu ]] || { echo 'The ci-npu account is required' >&2; exit 1; }
+limits=$("$python" -B - <<'LIMITS'
+import sys
+sys.path.insert(0, "test/ci_system/npu")
+from task_config import CONFIG_PATH, load_task
+limits = load_task(CONFIG_PATH)["timeouts"]
+print(limits["lock_wait_seconds"], limits["phase_execution_seconds"])
+LIMITS
+)
+read -r lock_wait phase_timeout <<< "$limits"
+wait_started=$SECONDS
+echo "Waiting for host lock: limit=${lock_wait}s"
 test -f /srv/npu-ci/locks/host-all.lock || { echo 'Host lock file does not exist' >&2; exit 1; }
 exec 9<> /srv/npu-ci/locks/host-all.lock
-flock -n 9 || { echo 'Host lock is held; tests were not started' >&2; exit 1; }
+flock -w "$lock_wait" 9 || { echo "Host lock wait timed out after $((SECONDS-wait_started))s; tests were not started" >&2; exit 1; }
+echo "Host lock acquired: waited=$((SECONDS-wait_started))s; execution limit=${phase_timeout}s"
+export NPU_LOCK_WAIT_SECONDS=$((SECONDS-wait_started))
+export NPU_ENVIRONMENT_ENTRY=/srv/tokenspeed-npu/cann9-torch29-py312-root/env.sh
+export NPU_ENVIRONMENT_SHA256=$(sha256sum "$NPU_ENVIRONMENT_ENTRY" | cut -d ' ' -f1)
 # Vendor setup may reference unset optional variables.
 echo 'Loading NPU environment: /srv/tokenspeed-npu/cann9-torch29-py312-root/env.sh'
 set +u
@@ -64,5 +80,5 @@ if [[ "${NPU_BOOTSTRAP_LOGGING:-}" = 1 ]]; then
 fi
 # Keep the lock in the executor process; it cleans up the child process group.
 exec /srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B -u \
-  test/ci/npu_test/run_phase.py --repo-root "$PWD" --phase "$phase" \
-  --output-dir "$work/$phase" --timeout-seconds 600
+  test/ci_system/npu/pipeline.py --repo-root "$PWD" --phase "$phase" \
+  --output-dir "$work/$phase" --timeout-seconds "$phase_timeout"

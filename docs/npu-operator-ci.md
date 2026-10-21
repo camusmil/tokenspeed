@@ -1,193 +1,141 @@
-# Ascend NPU ARM operator CI
+# Ascend NPU operator CI
 
-## Triggers and change selection
+The ARM workflow runs the registered operators on one prepared Linux VM. It
+executes **all accuracy tests before any performance tests**, with global
+fail-fast behavior. A failed test, incomplete result, timeout, or required
+evidence write stops subsequent tests and fails the job. Performance currently
+validates complete, finite timing samples; `performance_verdict` remains
+`not_evaluated`. There is no performance acceptance threshold.
 
-The workflow is `.github/workflows/pr-test-ascendnpu-arm.yml`, displayed as `PR Test Ascend NPU ARM`.
-It runs in `lightseekorg/tokenspeed` or the repository identified by the full `owner/repository` value of the `TOKENSPEED_NPU_CI_REPOSITORY` repository variable. Forks must explicitly set that variable.
-Triggers include pushes to main, `pull_request` events targeting main, and `workflow_dispatch`.
-The `select` job can run in an allowed repository. The hardware job additionally requires `TOKENSPEED_NPU_ARM_CI_ENABLED` to be set to `true`.
-When that variable is absent or disabled, the hardware job is skipped without entering a runner queue. A positive selection result does not mean the operators have run.
-The NPU allowlist uses its own `TOKENSPEED_NPU_CI_REPOSITORY` variable; it does not require the shared repository variable used by GPU workflows, so enabling NPU CI does not also enable other vendors' scheduling.
+## Entry points and selection
 
-Supported PR events are `opened`, `synchronize`, `reopened`, `ready_for_review`, and `labeled`. Only the `high priority` label triggers a run on a labeling event. Draft PRs do not start the NPU job.
-The label does not change the order: accuracy always precedes performance.
-The independent `pr-test-npu-arm` concurrency group is keyed by PR or ref. Automatic events cancel older runs in the same group; manual events do not initiate cancellation.
-Unrelated label events use a separate group to avoid canceling an active test run. Test code never runs through `pull_request_target`.
+`.github/workflows/pr-test-ascendnpu-arm.yml` handles pushes to `main`, pull
+requests targeting `main`, and manual dispatch. The selection job obtains changed
+paths through the GitHub API, including rename sources. Missing or truncated API
+results and stale pull request identities fail selection. Unrelated changes skip
+hardware explicitly. Manual dispatch selects the operator suite.
 
-The GitHub-hosted `select` job uses the same changed-file collection as NVIDIA ARM and AMD CI, then passes the path list to `test/ci/npu_test/changes.py`:
+Hardware requires `TOKENSPEED_NPU_ARM_CI_ENABLED=true`, the
+`ascend-npu-ops-test` runner label, and the exact runner name configured in
+`TOKENSPEED_NPU_ARM_RUNNER_NAME`. Draft pull requests skip hardware; this is not a
+hardware pass. A manual dispatch of the same branch can validate hardware without
+changing draft status. A fork must set `TOKENSPEED_NPU_CI_REPOSITORY` to its own
+`owner/repository`. The workflow does not change GPU workflows or shared CI
+controllers. Files under `test/**` can still trigger existing GPU path rules.
 
-- PRs use the paginated GitHub `/pulls/{number}/files` API. Both `filename` and `previous_filename` are classified, including renames into or out of watched paths.
-- Pushes use the GitHub `/compare/{before}...{after}` API and classify both filename fields.
-- Manual runs execute the full suite at the selected branch or tag's `GITHUB_SHA`.
-- API or path-input failures fail selection instead of silently skipping tests. The read-only token needs `contents: read` and `pull-requests: read`.
+## Files and task contract
 
-Like NVIDIA/AMD selection, this does not compare event base/head SHAs against the merge commit's parents or require full Git history. GitHub's current API file list supplies selection; it is not an immutable snapshot on reruns. PR-file and compare-API limits are inherited from the GPU approach. Tests still execute the event's `GITHUB_SHA`, with the hardware checkout SHA and cleanliness checks unchanged.
+- `test/ci/npu_test/ut-tokenspeed-kernel-npu.json` is the single task declaration:
+  operator registration, watched paths, stages, VM resources, and timeouts.
+- `test/ci/npu_test/test_case/test_*.py` contains actual operator definitions,
+  reference calculations, and timing parameters.
+- `test/ci_system/npu/ci_path_filter.py` selects tasks from complete API results.
+- `task_config.py` validates the declaration. `run_ci_task.sh` checks the VM and
+  acquires the shared host lock. `pipeline.py` executes and validates each stage.
+- `operator_cli.py` and `ci_test_plan.py` collect a plan without importing device
+  libraries or performing NPU computation. `ci_reporting.py` verifies results.
+- `ci_lifecycle.py` manages process supervision, artifact selection, upload
+  receipts, and cleanup. `artifact-policy.json` records the archive policy.
 
-Path rules in `test/ci/npu_test/manifest.json` cover the NPU package, the shared `tokenspeed-kernel/python/` dependency, dependency configuration, NPU CI scripts, and this workflow.
-Documentation changes ending in `.md` or `.rst` are excluded. Matching is case-sensitive and includes additions, modifications, deletions, and both sides of a rename, within the GitHub API response limits.
-Any matching path selects every registered operator. Unrelated changes emit `should_run=false` and `reason=no-watched-changes`.
-The workflow has no top-level path filter, so unrelated changes still produce a selection result.
-The existing selection step prints an English scheduling decision and writes it to the Actions summary, distinguishing unrelated changes, disabled hardware, draft PRs, and runner requests. A selected, enabled, non-draft run without `TOKENSPEED_NPU_ARM_RUNNER_NAME` fails before queuing hardware. Requesting a runner is not proof of NPU execution.
-NVIDIA/AMD workflows, shared path filters, task pipelines, and cancellation/retry controllers are unchanged.
-NPU CI implementation and operator tests live under `test/ci/npu_test/`; new operators are registered through its manifest rather than GPU task YAML files. The directory is inside the existing GPU workflows' shared `test/**` trigger scope, so changes can also start GPU scans and scheduling. GPU workflows and shared path filters are unchanged.
+Register another operator by adding its script and one task entry. Each script
+must implement explicit `--mode accuracy`, `--mode performance`, and `--mode all`,
+plus `--mode all --collect-plan`. There are no operator-name branches in the
+executor. Infrastructure acceptance scripts are maintained outside the production
+patch; the workflow has no dependency on those scripts.
 
-## Components and execution order
+Before accuracy execution, both stage plans are collected from the selected
+scripts and saved in `frozen-plan.json` outside the checkout. The plan binds the
+source commit, task hash, script/executor hashes, named cases/configurations,
+metadata, and timing requirements. Empty or duplicate plans fail. Performance
+requires a successful accuracy report and the same frozen-plan digest. Source or
+plan changes during execution fail validation. Actual records must match the
+planned order and parameters; missing, duplicate, extra, failed, or non-finite
+samples are rejected. The plan does not prevent an author from intentionally
+changing test coverage in a source change; review remains responsible for that.
 
-- `test/ci/npu_test/changes.py`: validates the manifest and classifies the supplied API paths.
-- `test/ci/npu_test/manifest.json`: schema version 3; defines watched paths, operator order, one `script` path per operator, and expected counts.
-- `test/ci/npu_test/expected-plans.json`: retains schema version 2; records accuracy cases, performance configurations, sampling parameters, and associated hashes.
-- `test/ci/npu_test/run_step.sh`: checks ARM/Linux after checkout and prepares the host lock, environment, and caches.
-- `test/ci/npu_test/run_phase.py`: executes one phase in order, supervises child processes and timeouts, saves evidence, and returns an exit code.
-- `test/ci/npu_test/reporting.py`: validates structured logs and generates JSON reports and English Markdown summaries.
-- `test/ci/npu_test/test_case/<operator>-test.py`: combines numerical checks and performance sampling in one script with a required `--mode` argument.
-- `test/ci/npu_test/operator_cli.py`: parses the explicit mode and runs the selected phase callbacks, stopping on the first failure.
+The initial task uses device 0 while holding the shared whole-host lock. The
+registered scatter and virtual-slots tests retain their existing cases and timing
+parameters. Model evaluation and nightly stability workloads are outside this
+operator-only implementation.
 
-The `test_case/` directory contains the registered operator scripts. Each `<operator>-test.py` runs by file path through the manifest or an explicit command and requires an NPU for accuracy and performance modes. The hyphenated names are executable script paths, not Python module import names.
+## Prepared VM contract
 
-The NPU job has two test steps (all accuracy, then all performance) and one evidence-only finalization step. Finalization runs after normal success or failure and never executes more operators.
-The executor starts each manifest `script` with `--mode accuracy` or `--mode performance`; it has no operator-name branches.
-The standalone `--mode all` option is a convenience for one operator only. CI does not use it: CI preserves the global ordering of all accuracy tests before any performance test.
-Both steps share the bootstrap through a YAML anchor. Before fetching repository scripts, the accuracy step validates deployment, platform, and event inputs, creates an isolated run/attempt directory, and checks out the requested SHA.
-Only then can it invoke the repository entry point.
-Source download makes one initial `git fetch` attempt and, on failure, up to three retries (four attempts total), waiting 30 seconds before each retry. Every attempt logs its number, original Git errors, and exit code. A successful fetch stops retrying immediately. Exhaustion returns the last failure code and prevents checkout and all operator tests. Cancellation is not retried. Only the fetch command is retried; checkout validation, environment setup, and operator failures still stop immediately. The existing 60-minute job timeout also applies during download and waits.
-There is no cross-run source cache: each run/attempt initializes a fresh Git repository and downloads the exact event SHA. Accuracy and performance reuse that checkout within the same job. The `tmp`, `cache`, and Triton cache paths belong only to the current run. They are deleted with its checkout after confirmed evidence upload, including after test failure. Python bytecode writing is disabled. Prepared CANN/Python environments remain reusable and are never part of run cleanup.
-The performance step reuses the directory only after accuracy succeeds. Both steps require Linux, `uname -m` equal to `aarch64` or `arm64`, the expected SHA, and a checkout without modified or untracked files.
-Checkout uses the format-checked, allowlisted `GITHUB_REPOSITORY` to fetch public source from `https://github.com/<owner>/<repository>.git` without forwarding access tokens.
-The interpreter path is fixed. Scripts use that interpreter with `-B -u`, and the two kernel package directories in the checkout precede other entries in `PYTHONPATH`.
+The runner must use the `ci-npu` account on Linux ARM64. The existing environment
+entry is `/srv/tokenspeed-npu/cann9-torch29-py312-root/env.sh`, and its interpreter
+is the adjacent `venv/bin/python`. The checkout's kernel source directories are
+placed first on `PYTHONPATH`. Reports record the source/task/plan identities,
+Python and package versions, environment-entry hash, and device allocation.
 
-| Operator | Accuracy cases | Performance configurations | Performance samples |
-| --- | --- | --- | --- |
-| scatter | 5 | 6 | 30 |
-| virtual_slots_to_local | 48 | 8 | 40 |
+All cooperating runners must use `/srv/npu-ci/locks/host-all.lock`. Each test stage
+waits at most 600 seconds for this lock and then has a separate 1800-second
+execution budget. Waiting is reported independently. The GitHub job timeout is
+90 minutes, including source preparation and finalization. File locking does not
+promise FIFO ordering or implement priority/preemption.
 
-The current suite has 53 accuracy cases, 14 performance configurations, and 70 samples.
-Each configuration performs 10 warmup iterations, then collects 5 samples of 50 executions each.
-Median latency is the median of the five per-execution sample averages, measured in milliseconds.
-The `record_only` policy validates execution and sampling completeness only: `performance_verdict=not_evaluated` and `threshold_ms=null`.
-There are no latency thresholds. A `completed` result does not mean performance passed a target.
+The bootstrap fetches the exact `GITHUB_SHA` into a new checkout. Fetch failures
+allow three retries after the initial attempt, with 30 seconds between attempts;
+each original Git error and exit code is retained. Cancellation is not retried.
+There is no shared source cache, shared compilation cache, or reuse of a mutable
+previous checkout. The prepared CANN environment and runner installation remain
+outside per-run cleanup.
 
-## Failures, logs, and cleanup
+Linux test subprocesses run under a separate supervisor. A pipe detects phase
+controller death, including `SIGKILL`; the supervisor also checks the owning
+Runner.Worker's PID, start time, and boot identity. It terminates the test process
+group before releasing its inherited host lock. Normal completion, cancellation,
+and timeout also clean up that group. This protects against controller/Worker
+exit; simultaneous termination of every supervisor or a host crash is outside
+that live-process guarantee. Unarchived files remain discoverable by the pending
+check and require operator handling; they are never inferred to be archived.
 
-Any case, configuration, script, checkout, environment, or required evidence-write failure returns nonzero and stops subsequent tests.
-Later operators in the current phase are recorded as `not_run`; if accuracy fails, the performance step is skipped.
-Only necessary evidence saving and resource cleanup continue after failure. Report or Actions summary write failures also fail the step.
-Each script has a 600-second timeout, and the job has a 60-minute timeout. These limits are not performance thresholds.
+## Artifact policy and finalization
 
-Merged stdout/stderr is written to disk and flushed to the console as it arrives. Python output is unbuffered.
-Each operator prints its start, finish, elapsed time, and exit code. A heartbeat is printed every 30 seconds while a script remains active.
-Original exceptions are preserved. Error annotations escape `%`, CR, and LF; failure explanations and English summaries are generated within the same step.
-Bootstrap failures produce a summary naming the failed stage. Executor exceptions also include a traceback.
+There are two top-level test steps and one archive finalization step. Before
+source download, the trusted host lifecycle runtime generates a temporary local
+composite action in the runner workspace. This action uses the pinned official
+`actions/upload-artifact` implementation. No generated action or acceptance helper
+is committed as a separate source directory.
 
-Test subprocesses run in private process groups. Completion, nonzero exit, timeout, SIGINT, and SIGTERM all attempt to terminate remaining processes in that group.
-Test processes must not escape supervision by starting a new session. SIGKILL or host failure may leave partial logs without a final summary.
-The host lock covers environment preparation and execution within each phase and is released when the executor exits after child-process cleanup.
+Successful runs upload phase summaries and minimal context/identity information.
+Failed or interrupted runs upload available detailed logs, reports, and the
+frozen plan. Source-fetch failures include bootstrap diagnostics. Raw logs are
+hard-linked into the upload bundle on the same filesystem, so there is one
+physical log copy. Collection refuses to proceed while a registered producer is
+still active, and file digests are checked again before cleanup.
 
-## Runner deployment contract and evidence locations
+Artifacts are retained for 7 days, with a 1 GiB total selected-file limit. Upload
+has at most three step-level attempts; each attempt uses a distinct artifact
+name. The underlying official action may also retry its own transport requests.
+Only a successful upload with an artifact ID and digest permits removal of this
+run's checkout, temporary files, cache, logs, and local bundle. A minimal receipt
+is retained separately. Cleanup failure is reported as a finalization failure.
 
-`runs-on` uses only the dedicated `ascend-npu-ops-test` label, without adding the default `self-hosted` label.
-The hardware job is disabled by default. These are deployment requirements, not assertions that upstream already has a runner, NPU, or configured runtime.
-From the repository home page, open **Settings > Secrets and variables > Actions > Variables** and configure these repository variables:
+If collection or upload fails, the job fails and local evidence remains. After
+24 hours, the pending check raises an operator-action warning; it does **not**
+automatically delete unarchived evidence. The 24-hour value is a warning boundary,
+not permission to destroy the only log copy. Upload failure does not hold the NPU
+lock after computation has stopped.
 
-| Variable | Purpose |
-| --- | --- |
-| `TOKENSPEED_NPU_CI_REPOSITORY` | Forks set their full `owner/repository`; the official `lightseekorg/tokenspeed` repository is already allowlisted |
-| `TOKENSPEED_NPU_ARM_RUNNER_NAME` | Must match the registered runner name and runtime `RUNNER_NAME`; there is no default |
-| `TOKENSPEED_NPU_ARM_CI_ENABLED` | Set to `true` only after deployment requirements are met; leave unset to disable the hardware job |
+## Host runtime installation and troubleshooting
 
-Assign the dedicated label to an online Linux ARM64 NPU runner running under the `ci-npu` service account. Runner names, labels, and runner groups are separate settings: the registered name or group does not supply this label. Existing runners can retain their other labels when `ascend-npu-ops-test` is added. Organization runner groups must also permit this repository and workflow.
-Once enabled, a missing runner-name variable fails selection before queuing; a mismatched value fails the hardware step before checkout.
-If no online runner has the required label, the job waits for scheduling and cannot execute runtime checks.
-The environment entry point is `/srv/tokenspeed-npu/cann9-torch29-py312-root/env.sh`, and the interpreter is `venv/bin/python` under the same directory.
-Working CANN, torch, torch_npu, and Triton Ascend dependencies and NPU device access for that account are required. Installing the runner alone is insufficient.
-The account must have read/write access to `/srv/npu-ci/locks/host-all.lock`. An occupied lock fails immediately without starting tests.
-Create `/srv/npu-ci/jobs/slot0` in advance and allow `ci-npu` to create run and cache directories there. These account and path requirements remain fixed deployment contracts.
-PRs execute repository test code. Use a dedicated isolated runner, preserve GitHub's external-contributor approval policy, and do not inject deployment credentials into test processes.
+Install the reviewed `ci_lifecycle.py` and `artifact-policy.json` as root-owned,
+non-writable-by-runner files under `/srv/npu-ci/runtime/vm-phase1`. Create a
+root-owned `policy.json` that combines the archive policy with the actual
+`repository`, `jobs_root`, `evidence_root`, `state_root`, and
+`minimum_free_bytes`. Jobs/evidence/state directories must be separate from older
+runtime directories and writable by `ci-npu`; jobs and evidence must share a
+filesystem. The bootstrap verifies that the selected commit's lifecycle source
+and artifact policy exactly match the installed runtime before testing.
 
-The console prints the run directory `/srv/npu-ci/jobs/slot0/actions-<run_id>-<attempt>.*`.
-It contains `source.txt`, `checkout/`, separate `accuracy/` and `performance/` result directories, and caches.
-Each phase directory contains `context.json`, `report.json`, and `summary.md`. Operator directories contain raw logs, `process.json`, `result.json`, and known exit codes.
-Summaries are appended to `GITHUB_STEP_SUMMARY`. The bootstrap log has UTC timestamps and preserves download and environment errors. `fetch.tsv` records every download attempt, duration, and exit code, also rendered in the summary. Operator output is persisted once by the executor and streamed directly to Actions, without duplicating it in the bootstrap log. Controller exceptions are saved separately as `executor-error.log`.
+The host's periodic pending check invokes the installed helper with
+`--policy /srv/npu-ci/runtime/vm-phase1/policy.json gc --mode apply`. It reports
+unarchived runs, preserves active or unknown owners, and does not touch runner
+diagnostic logs, older runtimes, historical evidence, or other jobs. A deployment
+update must preserve those boundaries and must not restart the runners.
 
-The archive step stages only bootstrap/source metadata, operator logs and reports, and a SHA-256 file manifest. It excludes the checkout, caches, environment variables, and installed dependencies. Staging uses hard links on the same filesystem, so raw logs occupy one local copy. The official upload action is pinned to a commit and retains the artifact for 30 days. After it returns success, an artifact ID, and its SHA-256 digest, the finalizer records that receipt and removes this run's work directory, including `cache/` and `tmp/`. The summary includes the artifact link and upload/cleanup status. Upload or evidence validation failure fails finalization and preserves local work and evidence; original test outcomes remain visible.
-
-Local archived evidence lives under the configured evidence root as `<run_id>-<attempt>/bundle/`. Keep confirmed successful evidence for one day and failed/cancelled evidence for seven days. A daily host timer expires it only after its owning `Runner.Worker` has exited. PID, process start time, and Linux boot ID protect downloads and gaps between test steps; the per-phase NPU lock alone is insufficient for retention. Unconfirmed uploads, unknown owners, altered evidence, unrecognized legacy directories, and paths outside the configured slot are retained. Cancellation, SIGKILL, or host failure can prevent finalization; there is no guarantee of upload in those cases. Retained unconfirmed evidence requires operator review/re-upload and is never silently deleted. The next CI summary includes the last host cleanup result.
-
-### Host retention deployment
-
-Install the reviewed `lifecycle.py` and `archive/action.yml` from this change as root-owned, read-only files under `/srv/npu-ci/runtime/evidence-v1/`. The accuracy bootstrap copies this trusted local composite action into the Actions workspace **before fetching source**, so evidence upload also works when fetch fails. Do not replace this runtime while a job uses it; deploy a new versioned runtime for future incompatible changes. No PR-controlled test code is installed into the runtime by the workflow.
-
-Copy `retention-policy.example.json` to that runtime as `policy.json`, set `repository` to the actual repository, and create the configured jobs/evidence/state roots writable by `ci-npu`. Policy paths must be absolute, real directories, without symlinks. The example uses the fork slot; other slots need separate roots, policy, and service names. The 10 GiB free-space preflight fails before downloading when insufficient space remains.
-
-Install the supplied `npu-ci-retention.service` and `.timer` after running `lifecycle.py --policy <policy> gc --mode dry-run` and reviewing its output. The timer runs daily at 03:30 Asia/Shanghai and catches up after downtime. The service uses `ci-npu`, restricted write paths, low scheduling priority, and a nonblocking cleanup lock; it never stops or restarts runners. It leaves legacy/manual proof directories untouched. Runner diagnostic logs older than 14 days are eligible only when not open; `pages/blocks` remain managed by Runner itself. Prepared environments and other runner slots are outside its write scope. No GitHub credentials are needed by the cleanup service.
-
-Cleanup writes `last-gc.json` in the state root and logs decisions to the service journal. Unconfirmed-upload entries remain protected; monitor their age/space usage and restore uploading before the free-space preflight blocks new work. Dry-run does not delete files or change the last applied cleanup status. Deploy from a clean baseline worktree rather than reusing a fault-injection branch.
-
-## CPU regression checks
-
-Run `python3 -B -m unittest test.ci.npu_test.test_changes test.ci.npu_test.test_fetch test.ci.npu_test.test_lifecycle` from the repository root in an environment with PyYAML installed. The retry tests replace only the unavailable remote transport, use real local Git fetches and real 30-second waits, and cover immediate success, recovery on attempts two/four, exhaustion, and cancellation. Independent cases run concurrently and take about 90 seconds overall. They do not run NPU code or require a network connection.
-
-## Adding cases, operators, and structured events
-
-To add a case, update its script and test plan, then synchronize parameters, ordering, counts, and script hashes in `expected-plans.json`.
-To add an operator, create `test/ci/npu_test/test_case/<name>-test.py`, register its name, a single `script` field pointing to that canonical path, and counts in the manifest's `operators` list, and add its accuracy plan, performance plan, and timing parameters to the expected plan.
-Each script must accept the required `--mode {accuracy,performance,all}` argument. Parse arguments before importing NPU dependencies so `--help`, missing arguments, and invalid values work on a CPU host.
-Use the shared CLI with two callbacks returning integer exit codes; `all` calls accuracy first and starts performance only after accuracy returns zero. Exceptions, nonzero exits, and invalid callback results stop execution. Do not store the active mode in mutable global state.
-Schema version 3 rejects the former per-phase `scripts` mapping. The expected plan keeps its existing case/configuration data and schema version 2, with one `source_sha256` entry for each registered script.
-Update `watch_paths` for new source dependencies. Do not add operator-name branches to the common executor or additional workflow steps.
-
-Each structured event occupies one line: `NPU_RESULT_JSON=<JSON object>`. Use `allow_nan=False` and flush output promptly.
-Common fields are `schema_version=1`, `operator`, `phase`, and `event`; machine field names and values remain unchanged.
-Other lines may contain diagnostics, but must not embed the structured marker. Duplicate keys, NaN/Infinity, out-of-order or missing events, and inconsistent counts fail validation.
-
-- Accuracy: emit `started` with `expected_cases` and `case_names`; then `case_started` and `case_completed` for each case, including the complete `case`, planned metadata fields, and completion `status`; finally emit `completed` with expected, completed, passed, and failed counts.
-- Performance: emit `started` with `expected_configs` and `config_names`; for each configuration, emit `config_started` with the complete `config`, metadata, `warmup`, `iterations`, and `expected_samples`. Emit `sample` events with a configuration-name string, zero-based `sample_index`, and positive finite `latency_ms`. Emit `config_completed` with the sample list, count, median, `threshold_ms=null`, and `performance_verdict=not_evaluated`; finally emit `completed` with expected and completed configuration counts.
-- On the first failure, emit a terminal `failed` event and return nonzero. Include completed counts, `current_case` or `current_config`, and the original `error_type` and `error`. Do not continue to the next case or configuration. Uncaught import or process errors may omit the terminal event; the executor still reports failure.
-
-See `validate_accuracy` and `validate_performance` in `reporting.py` for field validation, and the existing operator scripts for examples.
-Any byte change to the manifest or registered scripts, including formatting, requires hash synchronization.
-Hashes bind the plan to specific files; they do not replace review of expected values. After formatting, run from the repository root:
-
-```bash
-python3 - <<'PY'
-import hashlib, json
-from pathlib import Path
-root = Path('test/ci/npu_test')
-manifest = json.loads((root / 'manifest.json').read_text())
-plan_path = root / 'expected-plans.json'
-plan = json.loads(plan_path.read_text())
-plan['manifest_sha256'] = hashlib.sha256((root / 'manifest.json').read_bytes()).hexdigest()
-plan['source_sha256'] = {
-    entry['script']: hashlib.sha256(Path(entry['script']).read_bytes()).hexdigest()
-    for entry in manifest['operators']
-}
-plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False) + '\n')
-PY
-```
-
-Before committing, run the complete `pre-commit run --all-files` in the target environment, recheck the plan hashes, and sign off the commit. Validate operator changes through the ARM NPU workflow.
-After loading the environment on an ARM runner, each operator has three standalone modes. For example, from the repository root:
-
-```bash
-export PYTHONPATH="$PWD/tokenspeed-kernel/python:$PWD/tokenspeed-kernel-npu/python${PYTHONPATH:+:$PYTHONPATH}"
-/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B -u \
-  test/ci/npu_test/test_case/scatter-test.py --mode accuracy
-/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B -u \
-  test/ci/npu_test/test_case/scatter-test.py --mode performance
-/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B -u \
-  test/ci/npu_test/test_case/scatter-test.py --mode all
-```
-
-Use `test_case/virtual_slots_to_local-test.py` in place of `test_case/scatter-test.py` for the other operator. There is no default mode.
-`all` performs accuracy and then performance for that operator, preserving distinct `phase=accuracy` and `phase=performance` structured events. Any accuracy failure prevents performance from starting.
-Standalone scripts print results but do not acquire the workflow host lock or save phase reports. They are not a replacement for the CI entry point.
-
-To invoke the common phase executor directly with a new output directory:
-
-```bash
-/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B -u \
-  test/ci/npu_test/run_phase.py --repo-root "$PWD" --phase accuracy \
-  --output-dir /tmp/npu-accuracy-unique --timeout-seconds 600
-```
-
-Direct executor invocation does not include the workflow's host lock or deployment checks. Prefer the workflow entry point for acceptance and use an output directory that does not already exist.
-Final acceptance requires real Actions runs demonstrating success, unrelated-change skipping, accuracy failure with performance skipped, and agreement between Actions summaries and VM evidence.
+For failures, inspect the failed test step and its summary, then the run's
+`npu-evidence-<run>-<attempt>-upload-<n>` artifact. An absent artifact with a failed
+finalizer requires checking the managed work directory on the VM. A deployment
+identity mismatch requires updating the reviewed host runtime; a source-fetch
+failure is not an operator failure, and retry success is not proof of a permanent
+network repair.

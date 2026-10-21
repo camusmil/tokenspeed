@@ -24,10 +24,9 @@ from __future__ import annotations
 
 import argparse
 import codecs
-import hashlib
+import importlib.metadata
 import json
 import os
-import runpy
 import selectors
 import signal
 import subprocess
@@ -35,6 +34,20 @@ import sys
 import time
 import traceback
 from pathlib import Path
+
+import ci_reporting
+from ci_test_plan import file_digest, freeze_plan, read_frozen, verify_identity
+from task_config import CONFIG_PATH, load_task
+
+
+def environment_packages():
+    versions = {}
+    for name in ("torch", "torch-npu", "triton-ascend"):
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = "not-installed"
+    return versions
 
 
 def positive_seconds(value):
@@ -58,26 +71,22 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def load_inputs(repo_root):
+def load_inputs(repo_root, phase, work):
     root = Path(repo_root).resolve(strict=True)
-    scanner = runpy.run_path(
-        str(root / "test/ci/npu_test/changes.py"),
-        run_name="npu_phase_scanner",
-    )
-    reporting = runpy.run_path(
-        str(root / "test/ci/npu_test/reporting.py"),
-        run_name="npu_phase_reporting",
-    )
-    manifest_path = root / "test/ci/npu_test/manifest.json"
-    manifest = scanner["load_manifest"](manifest_path)
-    manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-    plan = reporting["read_expected_plan"](
-        root / manifest["expected_plans"],
-        manifest,
-        manifest_sha256,
-        root,
-    )
-    return root, manifest, plan, reporting
+    task = load_task(root / CONFIG_PATH)
+    reporting = vars(ci_reporting)
+    if phase == "accuracy":
+        plan, plan_digest = freeze_plan(root, task, work, capture_test, save_text)
+    else:
+        report = ci_reporting.decode_record(
+            (Path(work) / "accuracy/report.json").read_text()
+        )
+        ci_reporting.require(
+            report["exit_code"] == 0, "Accuracy did not complete successfully"
+        )
+        plan_digest = report["metadata"]["plan_sha256"]
+        plan = read_frozen(root, task, work, plan_digest)
+    return root, task, plan, plan_digest, reporting
 
 
 def stop_process_group(process):
@@ -101,6 +110,8 @@ def stop_process_group(process):
 def capture_test(command, repo_root, log_path, timeout_seconds):
     """Stream merged output to disk and console; preserve the child exit code."""
     process = None
+    parent_write = None
+    parent_read = None
     saved = False
     capture_error = None
     path = Path(log_path)
@@ -111,6 +122,23 @@ def capture_test(command, repo_root, log_path, timeout_seconds):
             deadline = started + timeout_seconds
             next_heartbeat = started + 30
             try:
+                passed_fds = ()
+                if sys.platform == "linux":
+                    parent_read, parent_write = os.pipe()
+                    passed_fds = (parent_read,)
+                    try:
+                        os.fstat(9)
+                        passed_fds += (9,)
+                    except OSError:
+                        pass
+                    command = [
+                        sys.executable,
+                        "-B",
+                        str(Path(__file__).with_name("ci_lifecycle.py")),
+                        "supervise",
+                        str(parent_read),
+                        *command,
+                    ]
                 process = subprocess.Popen(
                     command,
                     cwd=repo_root,
@@ -119,7 +147,15 @@ def capture_test(command, repo_root, log_path, timeout_seconds):
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                     bufsize=0,
+                    pass_fds=passed_fds,
+                    env=dict(
+                        os.environ,
+                        NPU_PROCESS_RECORD=str(path.with_suffix(".owner.json")),
+                    ),
                 )
+                if parent_read is not None:
+                    os.close(parent_read)
+                    parent_read = None
                 with selectors.DefaultSelector() as selector:
                     selector.register(process.stdout, selectors.EVENT_READ)
                     while selector.get_map():
@@ -154,6 +190,9 @@ def capture_test(command, repo_root, log_path, timeout_seconds):
                         stop_process_group(process)
                     finally:
                         process.stdout.close()
+                for fd in (parent_read, parent_write):
+                    if fd is not None:
+                        os.close(fd)
             log.flush()
             os.fsync(log.fileno())
         saved = True
@@ -241,17 +280,35 @@ def run_operator(root, entry, phase, plan, reporting, output_dir, timeout):
 
 
 def execute_phase(
-    root, manifest, plan, reporting, phase, output_dir, timeout, github_summary=None
+    root,
+    task,
+    plan,
+    plan_digest,
+    reporting,
+    phase,
+    output_dir,
+    timeout,
+    github_summary=None,
 ):
-    reporting["require"](phase in manifest["execution"]["phases"], "Unknown phase")
+    reporting["require"](phase in task["execution"]["phases"], "Unknown phase")
     output = Path(output_dir).resolve()
     output.mkdir(parents=True, exist_ok=False)
     metadata = {
         "repo_root": str(root),
         "python": sys.executable,
         "started_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "manifest_sha256": plan["manifest_sha256"],
+        "task_sha256": plan["task_sha256"],
+        "plan_sha256": plan_digest,
+        "source_sha": plan["source_sha"],
+        "environment": {
+            "python_version": sys.version,
+            "packages": environment_packages(),
+            "device_ids": task["resources"]["device_ids"],
+            "environment_entry": os.environ.get("NPU_ENVIRONMENT_ENTRY"),
+            "environment_sha256": os.environ.get("NPU_ENVIRONMENT_SHA256"),
+        },
         "timeout_seconds": timeout,
+        "lock_wait_seconds": os.environ.get("NPU_LOCK_WAIT_SECONDS"),
         "evidence_directory": str(output),
     }
     save_text(
@@ -260,7 +317,10 @@ def execute_phase(
     )
     results = []
     actions = os.environ.get("GITHUB_ACTIONS") == "true"
-    for entry in manifest["operators"]:
+    deadline = time.monotonic() + timeout
+    for entry in task["operators"]:
+        verify_identity(root, task, plan)
+        ci_reporting.require(time.monotonic() < deadline, "Phase execution timeout")
         name = entry["name"]
         started = time.monotonic()
         print(f"Execution started: {name}/{phase}", flush=True)
@@ -274,7 +334,7 @@ def execute_phase(
                 plan["operators"][name],
                 reporting,
                 output,
-                timeout,
+                max(0.001, deadline - time.monotonic()),
             )
         finally:
             if actions:
@@ -283,6 +343,11 @@ def execute_phase(
             f"Execution finished: {name}/{phase}, exit={result['exit_code']}, "
             f"elapsed={time.monotonic()-started:.2f}s, status={result['status']}",
             flush=True,
+        )
+        verify_identity(root, task, plan)
+        ci_reporting.require(
+            file_digest(output.parent / "frozen-plan.json") == plan_digest,
+            "Frozen plan changed during execution",
         )
         results.append(result)
         if not reporting["phase_succeeded"](result, phase):
@@ -293,7 +358,7 @@ def execute_phase(
             )
             break
     metadata["finished_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    report = reporting["make_report"](results, metadata, manifest, phase)
+    report = reporting["make_report"](results, metadata, task, phase)
     print(reporting["render_summary"](report), flush=True)
     saved = reporting["save_report"](report, output, github_summary)
     print("Structured report:", saved["json"]["path"], flush=True)
@@ -342,7 +407,9 @@ def main(argv=None):
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[signum] = signal.signal(signum, handle_interrupt)
-        root, manifest, plan, reporting = load_inputs(args.repo_root)
+        root, task, plan, plan_digest, reporting = load_inputs(
+            args.repo_root, args.phase, args.output_dir.parent
+        )
         paths = [
             root / "tokenspeed-kernel/python",
             root / "tokenspeed-kernel-npu/python",
@@ -361,8 +428,9 @@ def main(argv=None):
         print("Source directory:", root, flush=True)
         return execute_phase(
             root,
-            manifest,
+            task,
             plan,
+            plan_digest,
             reporting,
             args.phase,
             args.output_dir,

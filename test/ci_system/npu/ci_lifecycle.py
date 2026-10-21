@@ -22,20 +22,22 @@
 
 import argparse
 import csv
-import errno
 import hashlib
 import json
 import os
 import re
+import select
 import shutil
+import signal
 import stat
+import subprocess
 import sys
 import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-SCHEMA = 1
+SCHEMA = 2
 RUN_NAME = re.compile(r"actions-([0-9]+)-([0-9]+)\.[A-Za-z0-9_]+")
 PHASE_FILES = {"context.json", "report.json", "summary.md", "executor-error.log"}
 OPERATOR_FILES = {"process.json", "result.json"}
@@ -77,7 +79,7 @@ def utc(timestamp):
 
 def load_policy(path):
     policy = read_json(path)
-    for key in ("jobs_root", "evidence_root", "state_root", "diag_root"):
+    for key in ("jobs_root", "evidence_root", "state_root"):
         directory = Path(policy[key])
         require(
             directory.is_absolute() and directory == directory.resolve(),
@@ -89,13 +91,16 @@ def load_policy(path):
         "Invalid repository",
     )
     for key in (
-        "success_seconds",
-        "failure_seconds",
-        "diagnostic_seconds",
+        "artifact_retention_days",
+        "artifact_max_bytes",
+        "upload_attempts",
         "minimum_free_bytes",
         "pending_warning_seconds",
     ):
         require(type(policy[key]) is int and policy[key] >= 0, f"Invalid policy: {key}")
+    require(1 <= policy["artifact_retention_days"] <= 90, "Invalid artifact retention")
+    require(1 <= policy["upload_attempts"] <= 10, "Invalid upload attempts")
+    require(policy["artifact_max_bytes"] > 0, "Invalid artifact size limit")
     return policy
 
 
@@ -137,6 +142,10 @@ def owner_status(owner):
         return "unknown"
     try:
         actual = process_identity(int(owner["pid"]))
+        if Path("/proc").is_dir():
+            text = Path(f"/proc/{owner['pid']}/stat").read_text()
+            if text[text.rfind(")") + 2 :].split()[0] == "Z":
+                return "gone"
     except FileNotFoundError:
         return "gone"
     except (OSError, ValueError):
@@ -235,6 +244,24 @@ def evidence_directory(policy, state):
 
 def collect(policy, work, now):
     work, state = checked_work(policy, work)
+    for directory in (
+        work / "accuracy",
+        work / "performance",
+        work / "plan-collection",
+    ):
+        if directory.exists():
+            for record in directory.rglob("*.owner.json"):
+                for identity in read_json(record).values():
+                    require(
+                        owner_status(identity) == "gone",
+                        "Evidence producer is still active; refusing collection",
+                    )
+    logger = work / "bootstrap.owner.json"
+    if logger.exists():
+        require(
+            owner_status(read_json(logger)) == "gone",
+            "Bootstrap logger is still active",
+        )
     output = evidence_directory(policy, state)
     require(not output.is_symlink(), "Invalid evidence directory")
     output.mkdir(exist_ok=True)
@@ -245,7 +272,15 @@ def collect(policy, work, now):
     temporary = Path(tempfile.mkdtemp(prefix=".bundle-", dir=output))
     try:
         selected = []
-        for name in ("bootstrap.log", "fetch.tsv", "source.txt"):
+        succeeded = all(
+            state["phases"].get(phase, {}).get("exit") == 0
+            for phase in ("accuracy", "performance")
+        )
+        for name in (
+            ()
+            if succeeded
+            else ("bootstrap.log", "fetch.tsv", "source.txt", "frozen-plan.json")
+        ):
             if (work / name).exists():
                 require(
                     not (work / name).is_symlink(), "Evidence must not contain symlinks"
@@ -263,6 +298,8 @@ def collect(policy, work, now):
                 continue
             require(directory == directory.resolve(), "Invalid phase directory")
             for path in regular_files(directory):
+                if succeeded and path.name not in ("context.json", "summary.md"):
+                    continue
                 relative = path.relative_to(directory)
                 if len(relative.parts) == 1 and path.name in PHASE_FILES:
                     selected.append(path)
@@ -271,24 +308,19 @@ def collect(policy, work, now):
                 ):
                     if path.name in OPERATOR_FILES | {f"{phase}.log", f"{phase}.rc"}:
                         selected.append(path)
+        require(selected, "No evidence available for upload")
+        total = sum(source.stat().st_size for source in selected)
+        require(
+            total <= policy["artifact_max_bytes"],
+            "Evidence exceeds artifact size limit; retained locally",
+        )
         entries = []
         for source in sorted(selected):
             require(stat.S_ISREG(source.lstat().st_mode), "Invalid evidence file")
             target = temporary / source.relative_to(work)
             target.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                # The evidence and jobs roots share a filesystem on the host.
-                # Hard links avoid storing a second copy of raw operator logs.
-                os.link(source, target, follow_symlinks=False)
-            except OSError as exc:
-                if exc.errno != errno.EXDEV:
-                    raise
-                with os.fdopen(
-                    os.open(source, os.O_RDONLY | os.O_NOFOLLOW), "rb"
-                ) as src, target.open("xb") as dst:
-                    shutil.copyfileobj(src, dst)
-                    dst.flush()
-                    os.fsync(dst.fileno())
+            # These roots must share a filesystem; one inode holds each raw log.
+            os.link(source, target, follow_symlinks=False)
             entries.append(
                 {
                     "path": str(target.relative_to(temporary)),
@@ -323,6 +355,11 @@ def collect(policy, work, now):
         write_json(
             temporary / "manifest.json",
             {"schema": SCHEMA, "collected_at": utc(now), "files": entries},
+        )
+        require(
+            sum(path.stat().st_size for path in regular_files(temporary))
+            <= policy["artifact_max_bytes"],
+            "Evidence metadata exceeds artifact size limit",
         )
         os.rename(temporary, bundle)
         write_json(output / "lifecycle.json", state)
@@ -400,166 +437,50 @@ def acknowledge(
     remove_directory(work, policy["jobs_root"])
     receipt["work_removed"] = True
     write_json(output / "receipt.json", receipt)
+    # Preserve the minimal receipt outside the disposable evidence directory.
+    write_json(
+        Path(policy["state_root"]) / f"{state['run_id']}-{state['attempt']}.json",
+        dict(
+            receipt,
+            repository=state["repository"],
+            sha=state["sha"],
+            run_id=state["run_id"],
+            attempt=state["attempt"],
+        ),
+    )
+    remove_directory(output, policy["evidence_root"])
+    receipt["local_evidence_removed"] = True
     return receipt
 
 
-def open_diagnostic_files():
-    opened = set()
-    try:
-        for process in Path("/proc").iterdir():
-            if not process.name.isdigit() or process.stat().st_uid != os.getuid():
-                continue
-            try:
-                for fd in (process / "fd").iterdir():
-                    try:
-                        info = fd.stat()
-                        opened.add((info.st_dev, info.st_ino))
-                    except FileNotFoundError:
-                        pass
-            except FileNotFoundError:
-                pass
-    except (OSError, PermissionError):
-        return None
-    return opened
-
-
 def garbage_collect(policy, mode, now):
-    require(mode in ("dry-run", "apply"), "Explicit cleanup mode is required")
+    """Report abandoned unarchived runs; never destroy their only evidence."""
     result = {
         "at": utc(now),
         "mode": mode,
-        "removed": [],
-        "eligible": [],
-        "protected": [],
-        "unmanaged": 0,
+        "pending": [],
+        "unmanaged": [],
         "errors": [],
     }
     for work in Path(policy["jobs_root"]).iterdir():
-        if not (work / "lifecycle.json").is_file() or work.is_symlink():
-            result["unmanaged"] += 1
+        if not RUN_NAME.fullmatch(work.name):
+            result["unmanaged"].append(work.name)
             continue
         try:
             _, state = checked_work(policy, work)
-            result["protected"].append(
-                {
-                    "run_id": state["run_id"],
-                    "reason": (
-                        "active-or-unknown-owner"
-                        if owner_status(state["owner"]) != "gone"
-                        else "archive-not-confirmed"
-                    ),
-                }
-            )
-        except (OSError, ValueError, KeyError) as exc:
-            result["errors"].append(str(exc))
-    for output in Path(policy["evidence_root"]).iterdir():
-        try:
-            require(
-                output == output.resolve()
-                and output.is_dir()
-                and re.fullmatch(r"[0-9]+-[0-9]+", output.name),
-                "Invalid evidence directory",
-            )
-            state = read_json(output / "lifecycle.json")
-            require(
-                state["schema"] == SCHEMA
-                and state["repository"] == policy["repository"],
-                "Evidence repository mismatch",
-            )
-            require(
-                output == evidence_directory(policy, state),
-                "Evidence run identity mismatch",
-            )
-            if owner_status(state["owner"]) != "gone":
-                result["protected"].append(
-                    {"run_id": state["run_id"], "reason": "active-or-unknown-owner"}
-                )
-                continue
-            receipt_path = output / "receipt.json"
+            status = owner_status(state["owner"])
             if (
-                not receipt_path.exists()
-                or read_json(receipt_path).get("uploaded") is not True
-            ):
-                result["protected"].append(
-                    {"run_id": state["run_id"], "reason": "archive-not-confirmed"}
-                )
-                continue
-            receipt = read_json(receipt_path)
-            require(
-                re.fullmatch(r"[0-9]+", receipt["artifact_id"])
-                and re.fullmatch(r"[0-9a-f]{64}", receipt["artifact_digest"]),
-                "Invalid upload receipt",
-            )
-            retention = (
-                policy["success_seconds"]
-                if receipt["accuracy"] == receipt["performance"] == "success"
-                else policy["failure_seconds"]
-            )
-            if now - receipt["at"] < retention:
-                continue
-            verify_bundle(output / "bundle")
-            work = Path(state["work"])
-            match = RUN_NAME.fullmatch(work.name)
-            require(
-                work.parent == Path(policy["jobs_root"]) and match is not None,
-                "Evidence points outside the slot",
-            )
-            require(
-                list(match.groups()) == [state["run_id"], state["attempt"]],
-                "Evidence points at another run",
-            )
-            if work.exists():
-                _, current = checked_work(policy, work)
-                require(current["owner"] == state["owner"], "Work owner changed")
-                require(
-                    owner_status(current["owner"]) == "gone", "Work owner is active"
-                )
-            result["eligible"].append(output.name)
-            if mode == "apply":
-                if work.exists():
-                    remove_directory(work, policy["jobs_root"])
-                remove_directory(output, policy["evidence_root"])
-                result["removed"].append(output.name)
-        except (OSError, ValueError, KeyError) as exc:
-            result["errors"].append(f"{output.name}: {exc}")
-    pending = set()
-    for work in Path(policy["jobs_root"]).iterdir():
-        if work.is_symlink() or not (work / "lifecycle.json").is_file():
-            continue
-        try:
-            _, state = checked_work(policy, work)
-            if (
-                owner_status(state["owner"]) == "gone"
+                status == "gone"
                 and now - state["started_at"] >= policy["pending_warning_seconds"]
             ):
-                pending.add(state["run_id"])
-        except (OSError, ValueError, KeyError):
-            continue
-    result["overdue_unarchived_runs"] = sorted(pending)
-    if pending:
-        result["errors"].append(
-            f"Unconfirmed archives older than retention warning threshold: {len(pending)}"
-        )
-    opened = open_diagnostic_files()
-    if opened is not None:
-        for path in Path(policy["diag_root"]).glob("*.log"):
-            try:
-                info = path.lstat()
-                if not re.fullmatch(
-                    r"(?:Worker|Runner)_[0-9]{8}-[0-9]{6}-utc\.log", path.name
-                ) or not stat.S_ISREG(info.st_mode):
-                    continue
-                if (
-                    now - info.st_mtime < policy["diagnostic_seconds"]
-                    or (info.st_dev, info.st_ino) in opened
-                ):
-                    continue
-                result["eligible"].append(path.name)
-                if mode == "apply":
-                    path.unlink()
-                    result["removed"].append(path.name)
-            except OSError as exc:
-                result["errors"].append(str(exc))
+                result["pending"].append(
+                    {
+                        "work": work.name,
+                        "reason": "unarchived-evidence-requires-operator-action",
+                    }
+                )
+        except Exception as exc:
+            result["errors"].append({"work": work.name, "error": str(exc)})
     if mode == "apply":
         write_json(Path(policy["state_root"]) / "last-gc.json", result)
     return result
@@ -585,6 +506,150 @@ def stream_bootstrap(work, source, console):
 def append_summary(text):
     with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as handle:
         handle.write(text)
+
+
+def supervise(command, parent_fd):
+    """Keep a test group owned after controller/Runner death, including SIGKILL."""
+    require(sys.platform == "linux", "Process supervision requires Linux")
+    interrupted = []
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, lambda number, frame: interrupted.append(number))
+    owner = worker_identity() if os.environ.get("GITHUB_ACTIONS") == "true" else None
+    lock_fds = ()
+    try:
+        os.fstat(9)
+        lock_fds = (9,)
+    except OSError:
+        pass
+    process = subprocess.Popen(command, start_new_session=True, pass_fds=lock_fds)
+    reason = None
+    try:
+        record = os.environ.get("NPU_PROCESS_RECORD")
+        if record:
+            write_json(
+                record,
+                {
+                    "supervisor": process_identity(os.getpid()),
+                    "test": process_identity(process.pid),
+                },
+            )
+        while True:
+            # WNOWAIT keeps the group leader's PID reserved until group cleanup.
+            if (
+                os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                is not None
+            ):
+                break
+            if interrupted:
+                reason = f"supervisor interrupted: signal={interrupted[0]}"
+                break
+            ready, _, _ = select.select([parent_fd], [], [], 0.1)
+            if ready and not os.read(parent_fd, 1):
+                reason = "phase controller exited; reclaiming its test group"
+                break
+            if owner is not None and owner_status(owner) != "alive":
+                reason = "Runner worker exited; reclaiming its test group"
+                break
+    finally:
+        if reason:
+            try:
+                print(reason, file=sys.stderr, flush=True)
+            except BrokenPipeError:
+                pass
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            time.sleep(0.2)
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=5)
+        os.close(parent_fd)
+    if reason:
+        return 128 + (interrupted[0] if interrupted else signal.SIGTERM)
+    return process.returncode if process.returncode >= 0 else 128 - process.returncode
+
+
+def prepare_archive_action(workspace, policy):
+    """Generate the one finalization step from the trusted host runtime."""
+    action = Path(workspace).resolve() / ".npu-ci-archive-phase1"
+    if action.is_symlink():
+        action.unlink()
+    elif action.exists():
+        remove_directory(action, action.parent)
+    action.mkdir()
+    helper = '/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B "$NPU_CI_RUNTIME/ci_lifecycle.py" --policy "$NPU_CI_RUNTIME/policy.json"'
+    steps = [
+        {
+            "name": "Collect NPU evidence",
+            "id": "collect",
+            "shell": "bash",
+            "env": {"NPU_ARCHIVE_WORK": "${{ inputs.work }}"},
+            "run": helper + ' collect --work "$NPU_ARCHIVE_WORK"',
+        }
+    ]
+    for attempt in range(1, policy["upload_attempts"] + 1):
+        earlier_failed = "".join(
+            f" && steps.upload{i}.outcome != 'success'" for i in range(1, attempt)
+        )
+        steps.append(
+            {
+                "name": f"Upload NPU evidence (attempt {attempt}/{policy['upload_attempts']})",
+                "id": f"upload{attempt}",
+                "if": "${{ always() && steps.collect.outcome == 'success'"
+                + earlier_failed
+                + " }}",
+                "continue-on-error": True,
+                "uses": "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+                "with": {
+                    "name": "npu-evidence-${{ github.run_id }}-${{ github.run_attempt }}-upload-"
+                    + str(attempt),
+                    "path": "${{ steps.collect.outputs.path }}",
+                    "retention-days": policy["artifact_retention_days"],
+                    "if-no-files-found": "error",
+                    "include-hidden-files": False,
+                },
+            }
+        )
+    successful = " || ".join(
+        f"steps.upload{i}.outcome == 'success'"
+        for i in range(1, policy["upload_attempts"] + 1)
+    )
+    fields = {}
+    for field in ("artifact-id", "artifact-digest"):
+        value = " || ".join(
+            f"(steps.upload{i}.outcome == 'success' && steps.upload{i}.outputs.{field})"
+            for i in range(1, policy["upload_attempts"] + 1)
+        )
+        fields[field] = "${{ " + value + " || '' }}"
+    steps.append(
+        {
+            "name": "Confirm archive and remove this run's files",
+            "if": "${{ always() && steps.collect.outcome == 'success' }}",
+            "shell": "bash",
+            "env": {
+                "NPU_ARCHIVE_WORK": "${{ inputs.work }}",
+                "NPU_ACCURACY_OUTCOME": "${{ inputs.accuracy }}",
+                "NPU_PERFORMANCE_OUTCOME": "${{ inputs.performance }}",
+                "NPU_UPLOAD_OUTCOME": "${{ ("
+                + successful
+                + ") && 'success' || 'failure' }}",
+                "NPU_ARTIFACT_ID": fields["artifact-id"],
+                "NPU_ARTIFACT_DIGEST": fields["artifact-digest"],
+            },
+            "run": helper
+            + ' ack --work "$NPU_ARCHIVE_WORK" --outcome "$NPU_UPLOAD_OUTCOME" --artifact-id "$NPU_ARTIFACT_ID" --artifact-digest "$NPU_ARTIFACT_DIGEST" --accuracy "$NPU_ACCURACY_OUTCOME" --performance "$NPU_PERFORMANCE_OUTCOME"',
+        }
+    )
+    value = {
+        "name": "Archive NPU CI evidence",
+        "description": "Upload selected evidence before removing this run's disposable files.",
+        "inputs": {
+            name: {"description": name, "required": True}
+            for name in ("work", "accuracy", "performance")
+        },
+        "runs": {"using": "composite", "steps": steps},
+    }
+    (action / "action.yml").write_text(json.dumps(value, indent=2) + "\n")
 
 
 def cli():
@@ -636,28 +701,11 @@ def cli():
                 ("runner", "RUNNER_NAME"),
             )
         }
-        workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
-        action = workspace / ".npu-ci-archive"
-        if action.is_symlink():
-            action.unlink()
-        elif action.exists():
-            remove_directory(action, workspace)
-        shutil.copytree(Path(__file__).parent / "archive", action)
+        prepare_archive_action(os.environ["GITHUB_WORKSPACE"], policy)
         work = initialize(policy, identity, worker_identity(), now)
         with Path(os.environ["GITHUB_ENV"]).open("a") as handle:
             handle.write(f"NPU_CI_WORK={work}\n")
         print(work)
-        previous = Path(policy["state_root"]) / "last-gc.json"
-        if previous.exists():
-            status = read_json(previous)
-            append_summary(
-                f"\n### Host cleanup\n\nLast run: `{status['at']}`; removed: `{len(status['removed'])}`; errors: `{len(status['errors'])}`.\n"
-            )
-            if status["errors"]:
-                print(
-                    "::warning::Previous host cleanup reported errors; inspect npu-ci-retention.service",
-                    file=sys.stderr,
-                )
     elif args.command == "phase":
         phase_state(policy, args.work, args.phase, args.stage, args.exit, now)
         if args.phase == "accuracy" and (Path(args.work) / "fetch.tsv").exists():
@@ -669,11 +717,24 @@ def cli():
             )
     elif args.command == "log":
         checked_work(policy, args.work)
+        write_json(
+            Path(args.work) / "bootstrap.owner.json", process_identity(os.getpid())
+        )
         stream_bootstrap(args.work, sys.stdin.buffer, sys.stdout.buffer)
     elif args.command == "collect":
         bundle = collect(policy, args.work, now)
         with Path(os.environ["GITHUB_OUTPUT"]).open("a") as handle:
             handle.write(f"path={bundle}\n")
+        print(
+            json.dumps(
+                {
+                    "path": str(bundle),
+                    "files": [str(p) for p in regular_files(bundle)],
+                    "retention_days": policy["artifact_retention_days"],
+                    "upload_attempts": policy["upload_attempts"],
+                }
+            )
+        )
     elif args.command == "ack":
         receipt = acknowledge(
             policy,
@@ -706,11 +767,17 @@ def cli():
                 return 0
             result = garbage_collect(policy, args.mode, now)
         print(json.dumps(result, indent=2))
-        return 1 if result["errors"] else 0
+        if result["pending"]:
+            print(
+                "::warning::Unarchived NPU evidence is older than 24 hours; manual handling required"
+            )
+        return 1 if result["errors"] or result["pending"] else 0
     return 0
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "supervise":
+        raise SystemExit(supervise(sys.argv[3:], int(sys.argv[2])))
     try:
         raise SystemExit(cli())
     except Exception as exc:

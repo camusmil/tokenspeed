@@ -25,7 +25,7 @@ name: PR Test Ascend NPU ARM
     branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -33,7 +33,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: pr-test-npu-arm-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'high priority' && format('-ignored-label-{0}', github.run_id) || '' }}
+  group: pr-test-npu-arm-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
@@ -42,8 +42,7 @@ jobs:
     if: |
       (github.repository == 'lightseekorg/tokenspeed' ||
        github.repository == vars.TOKENSPEED_NPU_CI_REPOSITORY) &&
-      github.event.deleted != true &&
-      (github.event.action != 'labeled' || github.event.label.name == 'high priority')
+      github.event.deleted != true
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -65,31 +64,12 @@ jobs:
           NPU_PR_IS_DRAFT: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == true }}
         run: |
           set -euo pipefail
-          python3 -B -m unittest test.ci.npu_test.test_changes
-          changed_files="$RUNNER_TEMP/tokenspeed-changed-files.txt"
-          case "${{ github.event_name }}" in
-            pull_request)
-              gh api \
-                "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-                --paginate \
-                -q '.[] | .filename, (.previous_filename // empty)' \
-                > "$changed_files"
-              ;;
-            push)
-              gh api \
-                "/repos/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.event.after }}" \
-                -q '.files[] | .filename, (.previous_filename // empty)' \
-                > "$changed_files"
-              ;;
-            *)
-              : > "$changed_files"
-              ;;
-          esac
-          python3 -B test/ci/npu_test/changes.py \
+          python3 -B test/ci_system/npu/ci_path_filter.py \
             --repo-root "$GITHUB_WORKSPACE" \
-            --manifest test/ci/npu_test/manifest.json \
+            --task test/ci/npu_test/ut-tokenspeed-kernel-npu.json \
             --event-name "$GITHUB_EVENT_NAME" \
-            --changed-files "$changed_files" \
+            --event-path "$GITHUB_EVENT_PATH" \
+            --repository "$GITHUB_REPOSITORY" \
             --github-output "$GITHUB_OUTPUT" \
             | tee "$RUNNER_TEMP/npu-change-selection.json"
           python3 -B - "$RUNNER_TEMP/npu-change-selection.json" <<'PY'
@@ -147,11 +127,11 @@ jobs:
       needs.select.outputs.should_run == 'true' &&
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ascend-npu-ops-test
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       TOKENSPEED_NPU_CI_REPOSITORY: ${{ vars.TOKENSPEED_NPU_CI_REPOSITORY }}
       TOKENSPEED_NPU_ARM_RUNNER_NAME: ${{ vars.TOKENSPEED_NPU_ARM_RUNNER_NAME }}
-      NPU_CI_RUNTIME: /srv/npu-ci/runtime/evidence-v1
+      NPU_CI_RUNTIME: /srv/npu-ci/runtime/vm-phase1
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Run accuracy tests for all operators
@@ -167,7 +147,7 @@ jobs:
           work=""
           log_pid=""
           python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
-          helper="$NPU_CI_RUNTIME/lifecycle.py"
+          helper="$NPU_CI_RUNTIME/ci_lifecycle.py"
           policy="$NPU_CI_RUNTIME/policy.json"
           finish() {
             rc=$?
@@ -270,15 +250,18 @@ jobs:
               | tee "$work/source.txt"
           else
             work="${NPU_CI_WORK:?Missing accuracy checkout}"
-            [[ "$work" == /srv/npu-ci/jobs/slot0/actions-"${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}".* ]] || { echo 'Run directory does not match run_id/attempt' >&2; exit 1; }
+            [[ "$work" == /srv/npu-ci/jobs/vm-phase1/actions-"${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}".* ]] || { echo 'Run directory does not match run_id/attempt' >&2; exit 1; }
           fi
           stage=verify-checkout
           actual_sha=$(git -C "$work/checkout" rev-parse HEAD)
           require_equal checkout_sha "$GITHUB_SHA" "$actual_sha"
           status=$(git -C "$work/checkout" status --porcelain --untracked-files=all)
           [[ -z "$status" ]] || { echo 'Checkout contains modified or untracked files' >&2; exit 1; }
+          stage=verify-runtime
+          cmp "$helper" "$work/checkout/test/ci_system/npu/ci_lifecycle.py" || { echo 'Host lifecycle runtime does not match the selected source; deployment update required' >&2; exit 1; }
+          cmp "$NPU_CI_RUNTIME/artifact-policy.json" "$work/checkout/test/ci_system/npu/artifact-policy.json" || { echo 'Host artifact policy does not match selected source' >&2; exit 1; }
           stage=run-phase
-          bash "$work/checkout/test/ci/npu_test/run_step.sh" "$NPU_PHASE" "$work"
+          bash "$work/checkout/test/ci_system/npu/run_ci_task.sh" "$NPU_PHASE" "$work"
       - name: Run performance tests for all operators
         id: performance
         if: ${{ success() }}
@@ -288,7 +271,7 @@ jobs:
         run: *npu-bootstrap
       - name: Archive NPU CI evidence
         if: ${{ always() }}
-        uses: ./.npu-ci-archive
+        uses: ./.npu-ci-archive-phase1
         with:
           work: ${{ env.NPU_CI_WORK }}
           accuracy: ${{ steps.accuracy.outcome }}

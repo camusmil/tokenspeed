@@ -73,53 +73,6 @@ def decode_record(text):
     return record
 
 
-def read_expected_plan(path, manifest, manifest_sha256, repo_root):
-    """Check plan identity, registered scripts and expected item counts."""
-    plan = decode_record(Path(path).read_text(encoding="utf-8"))
-    require(
-        type(plan.get("schema_version")) is int and plan["schema_version"] == 2,
-        "Expected plan schema_version=2",
-    )
-    require(
-        plan.get("manifest_sha256") == manifest_sha256,
-        "Plan was generated for a different manifest",
-    )
-    operators = plan.get("operators")
-    registered = manifest["operators"]
-    require(type(operators) is dict, "Missing plan operators")
-    require(
-        set(operators) == {item["name"] for item in registered},
-        "Plan operators differ from manifest",
-    )
-    sources = plan.get("source_sha256")
-    scripts = {item["script"] for item in registered}
-    require(
-        type(sources) is dict and set(sources) == scripts,
-        "Plan source list differs from manifest",
-    )
-    for relative, expected in sources.items():
-        require(
-            type(expected) is str and re.fullmatch(r"[0-9a-f]{64}", expected),
-            f"Invalid source hash: {relative}",
-        )
-        actual = hashlib.sha256((Path(repo_root) / relative).read_bytes()).hexdigest()
-        require(actual == expected, f"Script differs from expected plan: {relative}")
-    for item in registered:
-        name = item["name"]
-        entry = operators[name]
-        require(type(entry) is dict, f"Invalid operator plan: {name}")
-        for phase, count_key in (
-            ("accuracy", "accuracy_cases"),
-            ("performance", "performance_configs"),
-        ):
-            values = entry.get(phase)
-            require(
-                type(values) is list and len(values) == item[count_key],
-                f"{name}/{phase}: plan count differs from manifest",
-            )
-    return plan
-
-
 def read_records(log_path, operator, phase):
     require(
         type(operator) is str and re.fullmatch(r"[a-z][a-z0-9_]*", operator),
@@ -620,7 +573,7 @@ def phase_succeeded(result, phase):
     )
 
 
-def make_report(results, metadata, manifest, phase):
+def make_report(results, metadata, task, phase):
     require(phase in ("accuracy", "performance"), "Unknown report phase")
     require(
         type(results) is list and all(type(r) is dict for r in results),
@@ -628,13 +581,13 @@ def make_report(results, metadata, manifest, phase):
     )
     require(type(metadata) is dict, "Report metadata must be an object")
     require(
-        type(manifest) is dict
-        and type(manifest.get("operators")) is list
-        and manifest["operators"],
-        "Invalid report manifest",
+        type(task) is dict
+        and type(task.get("operators")) is list
+        and task["operators"],
+        "Invalid report task",
     )
     names = []
-    for entry in manifest["operators"]:
+    for entry in task["operators"]:
         require(
             type(entry) is dict
             and type(entry.get("name")) is str

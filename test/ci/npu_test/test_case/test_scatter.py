@@ -36,8 +36,8 @@ import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from operator_cli import parse_mode, run_modes
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "ci_system/npu"))
+from operator_cli import emit_plan, parse_mode, run_modes
 
 if TYPE_CHECKING:
     import torch
@@ -354,9 +354,21 @@ class ScatterTests:
 
 
 def main(argv=None) -> int:
-    mode = parse_mode(argv, __doc__)
+    args = parse_mode(argv, __doc__)
+    if args.collect_plan:
+        if args.mode != "all":
+            raise ValueError("Plan collection requires --mode all")
+        emit_plan(
+            "scatter",
+            cases(),
+            configs(),
+            {"warmup": WARMUP, "iterations": ITERS, "sample_count": SAMPLES},
+            lambda c: {"dtype": "bfloat16"},
+            lambda c: {"dtype": "bfloat16", "page": 1},
+        )
+        return 0
     suite = ScatterTests()
-    return run_modes(mode, suite.run_accuracy, suite.run_performance)
+    return run_modes(args.mode, suite.run_accuracy, suite.run_performance)
 
 
 if __name__ == "__main__":
