@@ -1387,6 +1387,7 @@ def collect(policy, work, now, outcomes):
                 "checkout.log",
                 "frozen-plan.json",
                 *(f"fetch-{i}.log" for i in range(1, 5)),
+                *(f"fetch-{i}.json" for i in range(1, 5)),
             )
         ):
             if (work / name).exists():
@@ -1679,6 +1680,12 @@ def supervise(command, parent_fd):
             pass
         process.wait(timeout=5)
         os.close(parent_fd)
+        exit_record = os.environ.get("NPU_PROCESS_EXIT_RECORD")
+        if exit_record:
+            write_json(
+                exit_record,
+                {"process_exit_code": process.returncode, "supervisor_reason": reason},
+            )
     if reason:
         return 128 + (interrupted[0] if interrupted else signal.SIGTERM)
     return process.returncode if process.returncode >= 0 else 128 - process.returncode
@@ -1927,6 +1934,7 @@ def capture_test(command, repo_root, log_path, timeout_seconds):
                     env=dict(
                         os.environ,
                         NPU_PROCESS_RECORD=str(path.with_suffix(".owner.json")),
+                        NPU_PROCESS_EXIT_RECORD=str(path.with_suffix(".exit.json")),
                     ),
                 )
                 if parent_read is not None:
@@ -1985,7 +1993,18 @@ def capture_test(command, repo_root, log_path, timeout_seconds):
                     "type": type(save_error).__name__,
                     "message": str(save_error),
                 }
+    child = {}
+    if sys.platform == "linux" and process is not None:
+        try:
+            child = read_json(path.with_suffix(".exit.json"))
+        except Exception as exc:
+            capture_error = {
+                "type": type(exc).__name__,
+                "message": f"Process exit evidence missing: {exc}",
+            }
+            saved = False
     return {
+        **child,
         "exit_code": None if process is None else process.returncode,
         "log_path": str(path),
         "log_saved": saved,
@@ -2568,6 +2587,8 @@ def fetch_source(work, repository, sha):
             work / f"fetch-{attempt}.log",
             60,
         )
+        write_json(work / f"fetch-{attempt}.json", result)
+        print(f"Source fetch attempt {attempt}/4 finished: {result}", flush=True)
         with (work / "fetch.tsv").open("a") as output:
             output.write(
                 f"{attempt}\t{utc(started)}\t{utc(time.time())}\t{time.time()-started:.1f}\t{result['exit_code']}\n"
@@ -2586,7 +2607,7 @@ def fetch_source(work, repository, sha):
         if (
             not timed_out and result["exit_code"] in (130, 143, -2, -15)
         ) or attempt == 4:
-            raise RuntimeError(f"Source fetch failed: {result['exit_code']}")
+            raise RuntimeError(f"Source fetch failed after attempt {attempt}: {result}")
         print("Retrying source fetch in 30 seconds", flush=True)
         time.sleep(30)
 
