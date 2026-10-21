@@ -2275,8 +2275,17 @@ class NpuPytestPlugin:
         self.failures = []
         self.current = None
 
+    def pytest_collectreport(self, report):
+        if report.failed:
+            self.failures.append(str(report.longrepr))
+            print(str(report.longrepr), file=sys.stderr, flush=True)
+
     def pytest_collection_modifyitems(self, session, config, items):
-        require(items, "NPU suite collected zero tests")
+        if not items:
+            if not self.failures:
+                self.failures.append("NPU suite collected zero tests")
+                print(self.failures[-1], file=sys.stderr, flush=True)
+            return
         modules = {item.module for item in items}
         require(len(modules) == 1, "Expected exactly one registered operator module")
         module = self.module = modules.pop()
@@ -2336,6 +2345,8 @@ class NpuPytestPlugin:
         if report.when == "call":
             self.completed += 1
             self.passed += int(report.passed)
+        if report.when == "setup" and (report.failed or report.skipped):
+            self.current = None
         if report.failed or report.skipped:
             self.failures.append(str(report.longrepr))
             print(str(report.longrepr), file=sys.stderr, flush=True)

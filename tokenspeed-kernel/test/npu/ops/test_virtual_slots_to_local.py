@@ -302,14 +302,24 @@ def npu_suite():
 @pytest.mark.parametrize("case", cases(), ids=lambda case: case["name"])
 def test_accuracy(case, npu_suite):
     emit("accuracy", "case_started", case=case, **accuracy_metadata(case))
-    ok = npu_suite.run_case(
-        case["rows"],
-        case["degree"],
-        case["rank"],
-        getattr(npu_suite.torch, case["dtype"]),
-        case["geometry"],
-        case["prealloc"],
-    )
+    try:
+        ok = npu_suite.run_case(
+            case["rows"],
+            case["degree"],
+            case["rank"],
+            getattr(npu_suite.torch, case["dtype"]),
+            case["geometry"],
+            case["prealloc"],
+        )
+    except Exception:
+        emit(
+            "accuracy",
+            "case_completed",
+            case=case,
+            status="failed",
+            **accuracy_metadata(case),
+        )
+        raise
     emit(
         "accuracy",
         "case_completed",
