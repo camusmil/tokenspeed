@@ -29,7 +29,7 @@ import subprocess
 from fnmatch import fnmatchcase
 from pathlib import Path
 
-from task_config import load_task
+from pipeline import CONFIG_PATH, load_task
 
 
 def select_suite(task: dict, event_name: str, paths: set[str]) -> dict:
@@ -159,10 +159,24 @@ def main() -> int:
             args.repository, args.event_name, json.loads(args.event_path.read_text())
         )
         result = select_suite(task, args.event_name, paths)
+        matrix = {
+            "include": (
+                [
+                    {key: task[key] for key in ("name", "type", "runner")}
+                    | {"config": CONFIG_PATH}
+                ]
+                if result["should_run"]
+                else []
+            )
+        }
+        result["matrix"] = matrix
+        result["timeout_minutes"] = task["timeouts"]["job_minutes"]
         if args.github_output is not None:
             with args.github_output.open("a", encoding="utf-8") as output:
                 output.write(f"should_run={str(result['should_run']).lower()}\n")
                 output.write(f"reason={result['reason']}\n")
+                output.write(f"matrix={json.dumps(matrix)}\n")
+                output.write(f"timeout_minutes={task['timeouts']['job_minutes']}\n")
         print(json.dumps(result, indent=2))
         return 0
     except (

@@ -7,7 +7,9 @@
     "test/ci/npu_test/**",
     ".github/workflows/pr-test-ascendnpu-arm.yml",
     "test/ci_system/*ascend*",
-    "test/ci_system/npu/**"
+    "test/ci_system/npu/**",
+    "tokenspeed-kernel/test/npu/ops/**",
+    ".github/workflows/run-ci-task-matrix-npu.yml"
   ],
   "execution": {
     "phases": [
@@ -22,15 +24,15 @@
   "operators": [
     {
       "name": "scatter",
-      "script": "test/ci/npu_test/test_case/test_scatter.py"
+      "script": "tokenspeed-kernel/test/npu/ops/test_scatter.py"
     },
     {
       "name": "virtual_slots_to_local",
-      "script": "test/ci/npu_test/test_case/test_virtual_slots_to_local.py"
+      "script": "tokenspeed-kernel/test/npu/ops/test_virtual_slots_to_local.py"
     }
   ],
   "name": "ut-tokenspeed-kernel-npu",
-  "type": "operator",
+  "type": "ut",
   "workflow_stage": "operator",
   "triggers": [
     "push",
@@ -48,5 +50,15 @@
     "lock_wait_seconds": 600,
     "phase_execution_seconds": 1800,
     "job_minutes": 90
+  },
+  "runner": "ascend-npu-ops-test",
+  "report": {
+    "artifact_retention_days": 7,
+    "artifact_max_bytes": 1073741824,
+    "upload_attempts": 3
+  },
+  "cleanup": {
+    "delete_unarchived": false,
+    "pending_warning_seconds": 86400
   }
 }

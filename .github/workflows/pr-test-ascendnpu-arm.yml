@@ -37,7 +37,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  select:
+  scan:
     name: Check Ascend NPU ARM changes
     if: |
       (github.repository == 'lightseekorg/tokenspeed' ||
@@ -48,6 +48,9 @@ jobs:
     outputs:
       should_run: ${{ steps.changes.outputs.should_run }}
       reason: ${{ steps.changes.outputs.reason }}
+      matrix: ${{ steps.changes.outputs.matrix }}
+      timeout_minutes: ${{ steps.changes.outputs.timeout_minutes }}
+      checkout_ref: ${{ github.sha }}
     steps:
       - name: Check out event commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -119,160 +122,15 @@ jobs:
               raise SystemExit("Repository variable TOKENSPEED_NPU_ARM_RUNNER_NAME must be configured")
           PY
 
-  npu:
-    name: Ascend NPU ARM operator tests
-    needs: select
+  operator-tests:
+    needs: scan
     if: |
       vars.TOKENSPEED_NPU_ARM_CI_ENABLED == 'true' &&
-      needs.select.outputs.should_run == 'true' &&
+      needs.scan.outputs.should_run == 'true' &&
+      needs.scan.outputs.matrix != '{"include": []}' &&
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    runs-on: ascend-npu-ops-test
-    timeout-minutes: 90
-    env:
-      TOKENSPEED_NPU_CI_REPOSITORY: ${{ vars.TOKENSPEED_NPU_CI_REPOSITORY }}
-      TOKENSPEED_NPU_ARM_RUNNER_NAME: ${{ vars.TOKENSPEED_NPU_ARM_RUNNER_NAME }}
-      NPU_CI_RUNTIME: /srv/npu-ci/runtime/vm-phase1
-      PYTHONDONTWRITEBYTECODE: "1"
-    steps:
-      - name: Run accuracy tests for all operators
-        id: accuracy
-        shell: bash
-        env:
-          NPU_PHASE: accuracy
-        # The bootstrap must live here: the repository script is not available yet.
-        run: &npu-bootstrap |
-          set -Eeuo pipefail
-          stage=bootstrap
-          started=$SECONDS
-          work=""
-          log_pid=""
-          python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
-          helper="$NPU_CI_RUNTIME/ci_lifecycle.py"
-          policy="$NPU_CI_RUNTIME/policy.json"
-          finish() {
-            rc=$?
-            trap - EXIT
-            if (( rc != 0 )); then
-              message="ARM NPU ${NPU_PHASE}: ${stage} failed (exit=${rc})"
-              printf '::error::%s\n' "$message"
-              printf '\n### ARM NPU phase failed\n\nPhase: `%s`; stage: `%s`; exit: `%s`. See the raw logs in this step.\n' \
-                "$NPU_PHASE" "$stage" "$rc" >> "$GITHUB_STEP_SUMMARY" || rc=1
-            fi
-            printf 'ARM NPU phase finished: %s, exit=%s, elapsed=%ss\n' "$NPU_PHASE" "$rc" "$((SECONDS-started))"
-            if [[ -n "$log_pid" ]]; then
-              exec 1>&3 2>&4
-              wait "$log_pid" || { (( rc != 0 )) || rc=1; }
-            fi
-            if [[ -n "$work" ]]; then
-              "$python" -B "$helper" --policy "$policy" phase --work "$work" \
-                --phase "$NPU_PHASE" --stage "$stage" --exit "$rc" \
-                || { (( rc != 0 )) || rc=1; }
-            fi
-            exit "$rc"
-          }
-          trap finish EXIT
-          trap 'exit 130' INT
-          trap 'exit 143' TERM
-          require_equal() {
-            printf 'Checking %s: actual=%s; expected=%s\n' "$1" "$3" "$2"
-            [[ "$2" = "$3" ]] || { printf '%s does not match the deployment contract\n' "$1" >&2; return 1; }
-          }
-          fetch_source() {
-            local attempt rc=1 attempt_started attempt_at
-            for attempt in 1 2 3 4; do
-              attempt_started=$SECONDS
-              attempt_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-              printf '%s Fetching source: attempt %s/4, SHA=%s\n' "$attempt_at" "$attempt" "$GITHUB_SHA"
-              # The enclosing bootstrap streams this output to one local log.
-              if GIT_TERMINAL_PROMPT=0 git -C "$work/checkout" -c credential.helper= \
-                fetch --no-tags --depth=1 \
-                "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"; then
-                rc=0
-              else
-                rc=$?
-              fi
-              printf '%s\t%s\t%s\t%s\t%s\n' "$attempt" "$attempt_at" \
-                "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$((SECONDS-attempt_started))" "$rc" >> "$work/fetch.tsv"
-              if (( rc == 0 )); then
-                printf 'Source fetch succeeded on attempt %s/4\n' "$attempt"
-                return 0
-              fi
-              printf 'Source fetch attempt %s/4 failed (exit=%s)\n' "$attempt" "$rc" >&2
-              if (( rc == 130 || rc == 143 )); then
-                return "$rc"
-              fi
-              if (( attempt < 4 )); then
-                echo 'Retrying source fetch in 30 seconds'
-                sleep 30
-              fi
-            done
-            printf 'Source fetch failed after 4 attempts (exit=%s)\n' "$rc" >&2
-            return "$rc"
-          }
-          if [[ "$NPU_PHASE" = accuracy ]]; then
-            work=$("$python" -B "$helper" --policy "$policy" init)
-          else
-            work="${NPU_CI_WORK:?Missing accuracy checkout}"
-          fi
-          exec 3>&1 4>&2
-          exec > >("$python" -B "$helper" --policy "$policy" log --work "$work") 2>&1
-          log_pid=$!
-          export NPU_BOOTSTRAP_LOGGING=1
-          echo "ARM NPU phase started: $NPU_PHASE"
-          echo "Run directory: $work"
-          stage=deployment-contract
-          [[ -n "${TOKENSPEED_NPU_ARM_RUNNER_NAME:-}" ]] || { echo 'Repository variable TOKENSPEED_NPU_ARM_RUNNER_NAME must be configured' >&2; exit 1; }
-          require_equal runner "$TOKENSPEED_NPU_ARM_RUNNER_NAME" "$RUNNER_NAME"
-          require_equal server https://github.com "$GITHUB_SERVER_URL"
-          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ ]] || { echo 'Invalid GITHUB_REPOSITORY format' >&2; exit 1; }
-          [[ "${GITHUB_REPOSITORY#*/}" != . && "${GITHUB_REPOSITORY#*/}" != .. ]] || { echo 'Invalid GITHUB_REPOSITORY name' >&2; exit 1; }
-          [[ "$GITHUB_REPOSITORY" = lightseekorg/tokenspeed || ( -n "${TOKENSPEED_NPU_CI_REPOSITORY:-}" && "$GITHUB_REPOSITORY" = "$TOKENSPEED_NPU_CI_REPOSITORY" ) ]] || { echo 'GITHUB_REPOSITORY is not in the repository allowlist' >&2; exit 1; }
-          # Reject a mislabelled x86 runner before fetching or executing test code.
-          stage=platform
-          require_equal system Linux "$(uname -s)"
-          architecture=$(uname -m)
-          echo "Checking architecture: $architecture"
-          case "$architecture" in aarch64|arm64) ;; *) echo 'An ARM64 runner is required' >&2; exit 1 ;; esac
-          stage=runner-contract
-          require_equal user ci-npu "$(id -un)"
-          require_equal runner_environment self-hosted "$RUNNER_ENVIRONMENT"
-          stage=validate-event
-          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid GITHUB_SHA format' >&2; exit 1; }
-          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]] || { echo 'Invalid run_id/attempt format' >&2; exit 1; }
-          git check-ref-format "$GITHUB_REF"
-          if [[ "$NPU_PHASE" = accuracy ]]; then
-            stage=checkout
-            git init -q "$work/checkout"
-            fetch_source
-            git -C "$work/checkout" -c core.hooksPath=/dev/null checkout -q --detach FETCH_HEAD
-            printf 'repository=%s\nsha=%s\nref=%s\nrun_id=%s\nattempt=%s\n' \
-              "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$GITHUB_REF" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
-              | tee "$work/source.txt"
-          else
-            work="${NPU_CI_WORK:?Missing accuracy checkout}"
-            [[ "$work" == /srv/npu-ci/jobs/vm-phase1/actions-"${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}".* ]] || { echo 'Run directory does not match run_id/attempt' >&2; exit 1; }
-          fi
-          stage=verify-checkout
-          actual_sha=$(git -C "$work/checkout" rev-parse HEAD)
-          require_equal checkout_sha "$GITHUB_SHA" "$actual_sha"
-          status=$(git -C "$work/checkout" status --porcelain --untracked-files=all)
-          [[ -z "$status" ]] || { echo 'Checkout contains modified or untracked files' >&2; exit 1; }
-          stage=verify-runtime
-          cmp "$helper" "$work/checkout/test/ci_system/npu/ci_lifecycle.py" || { echo 'Host lifecycle runtime does not match the selected source; deployment update required' >&2; exit 1; }
-          cmp "$NPU_CI_RUNTIME/artifact-policy.json" "$work/checkout/test/ci_system/npu/artifact-policy.json" || { echo 'Host artifact policy does not match selected source' >&2; exit 1; }
-          stage=run-phase
-          bash "$work/checkout/test/ci_system/npu/run_ci_task.sh" "$NPU_PHASE" "$work"
-      - name: Run performance tests for all operators
-        id: performance
-        if: ${{ success() }}
-        shell: bash
-        env:
-          NPU_PHASE: performance
-        run: *npu-bootstrap
-      - name: Archive NPU CI evidence
-        if: ${{ always() }}
-        uses: ./.npu-ci-archive-phase1
-        with:
-          work: ${{ env.NPU_CI_WORK }}
-          accuracy: ${{ steps.accuracy.outcome }}
-          performance: ${{ steps.performance.outcome }}
+    uses: ./.github/workflows/run-ci-task-matrix-npu.yml
+    with:
+      matrix: ${{ needs.scan.outputs.matrix }}
+      checkout_ref: ${{ needs.scan.outputs.checkout_ref }}
+      timeout_minutes: ${{ fromJSON(needs.scan.outputs.timeout_minutes) }}
