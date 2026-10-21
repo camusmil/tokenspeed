@@ -58,38 +58,52 @@ jobs:
         NPU_TASK_NAME: ${{ matrix.name }}
         NPU_TASK_RUNNER: ${{ matrix.runner }}
         NPU_JOB_MINUTES: ${{ inputs.timeout_minutes }}
-      run: 'set -Eeuo pipefail
-
+      run: |
+        set -Eeuo pipefail
         python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
-
         helper="$NPU_CI_RUNTIME/pipeline.py"
-
         policy="$NPU_CI_RUNTIME/policy.json"
-
-        "$python" -B "$helper" prepare --policy "$policy" --config "$NPU_TASK_CONFIG" --name "$NPU_TASK_NAME" --runner "$NPU_TASK_RUNNER"
-        --timeout-minutes "$NPU_JOB_MINUTES"
-
-        '
+        "$python" -B "$helper" prepare --policy "$policy" --config "$NPU_TASK_CONFIG" --name "$NPU_TASK_NAME" --runner "$NPU_TASK_RUNNER" --timeout-minutes "$NPU_JOB_MINUTES"
     - name: Run operator accuracy
       id: accuracy
       shell: bash
       env:
         NPU_PHASE: accuracy
-      run: "set -Eeuo pipefail\npython=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python\nhelper=\"$NPU_CI_RUNTIME/pipeline.py\"\
-        \npolicy=\"$NPU_CI_RUNTIME/policy.json\"\nfinish() {\n  rc=$?\n  trap - EXIT\n  \"$python\" -B \"$helper\" lifecycle\
-        \ --policy \"$policy\" phase --work \"$NPU_CI_WORK\" --phase \"$NPU_PHASE\" --stage run-phase --exit \"$rc\" || rc=1\n\
-        \  exit \"$rc\"\n}\ntrap finish EXIT\ntrap 'exit 130' INT\ntrap 'exit 143' TERM\n\"$python\" -B \"$NPU_CI_WORK/checkout/test/ci_system/npu/pipeline.py\"\
-        \ run --work \"$NPU_CI_WORK\" --mode \"$NPU_PHASE\"\n"
+      run: |
+        set -Eeuo pipefail
+        python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
+        helper="$NPU_CI_RUNTIME/pipeline.py"
+        policy="$NPU_CI_RUNTIME/policy.json"
+        finish() {
+          rc=$?
+          trap - EXIT
+          "$python" -B "$helper" lifecycle --policy "$policy" phase --work "$NPU_CI_WORK" --phase "$NPU_PHASE" --stage run-phase --exit "$rc" || rc=1
+          exit "$rc"
+        }
+        trap finish EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        "$python" -B "$NPU_CI_WORK/checkout/test/ci_system/npu/pipeline.py" run --work "$NPU_CI_WORK" --mode "$NPU_PHASE"
     - name: Run operator performance
       id: performance
       shell: bash
       env:
         NPU_PHASE: performance
-      run: "set -Eeuo pipefail\npython=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python\nhelper=\"$NPU_CI_RUNTIME/pipeline.py\"\
-        \npolicy=\"$NPU_CI_RUNTIME/policy.json\"\nfinish() {\n  rc=$?\n  trap - EXIT\n  \"$python\" -B \"$helper\" lifecycle\
-        \ --policy \"$policy\" phase --work \"$NPU_CI_WORK\" --phase \"$NPU_PHASE\" --stage run-phase --exit \"$rc\" || rc=1\n\
-        \  exit \"$rc\"\n}\ntrap finish EXIT\ntrap 'exit 130' INT\ntrap 'exit 143' TERM\n\"$python\" -B \"$NPU_CI_WORK/checkout/test/ci_system/npu/pipeline.py\"\
-        \ run --work \"$NPU_CI_WORK\" --mode \"$NPU_PHASE\"\n"
+      run: |
+        set -Eeuo pipefail
+        python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
+        helper="$NPU_CI_RUNTIME/pipeline.py"
+        policy="$NPU_CI_RUNTIME/policy.json"
+        finish() {
+          rc=$?
+          trap - EXIT
+          "$python" -B "$helper" lifecycle --policy "$policy" phase --work "$NPU_CI_WORK" --phase "$NPU_PHASE" --stage run-phase --exit "$rc" || rc=1
+          exit "$rc"
+        }
+        trap finish EXIT
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        "$python" -B "$NPU_CI_WORK/checkout/test/ci_system/npu/pipeline.py" run --work "$NPU_CI_WORK" --mode "$NPU_PHASE"
     - name: Prepare evidence
       id: collect
       if: ${{ always() && env.NPU_CI_WORK != '' }}
@@ -97,18 +111,12 @@ jobs:
       env:
         NPU_ACCURACY: ${{ steps.accuracy.outcome }}
         NPU_PERFORMANCE: ${{ steps.performance.outcome }}
-      run: 'set -Eeuo pipefail
-
+      run: |
+        set -Eeuo pipefail
         python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
-
         helper="$NPU_CI_RUNTIME/pipeline.py"
-
         policy="$NPU_CI_RUNTIME/policy.json"
-
-        "$python" -B "$helper" lifecycle --policy "$policy" collect --work "$NPU_CI_WORK" --accuracy "$NPU_ACCURACY" --performance
-        "$NPU_PERFORMANCE"
-
-        '
+        "$python" -B "$helper" lifecycle --policy "$policy" collect --work "$NPU_CI_WORK" --accuracy "$NPU_ACCURACY" --performance "$NPU_PERFORMANCE"
     - name: Upload evidence (attempt 1)
       id: upload1
       if: ${{ always() && steps.collect.outcome == 'success' && fromJSON(steps.collect.outputs.upload_attempts) >= 1 }}
@@ -158,15 +166,9 @@ jobs:
         NPU_ARTIFACT_DIGEST: ${{ (steps.upload1.outcome == 'success' && steps.upload1.outputs.artifact-digest) || (steps.upload2.outcome
           == 'success' && steps.upload2.outputs.artifact-digest) || (steps.upload3.outcome == 'success' && steps.upload3.outputs.artifact-digest)
           || '' }}
-      run: 'set -Eeuo pipefail
-
+      run: |
+        set -Eeuo pipefail
         python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
-
         helper="$NPU_CI_RUNTIME/pipeline.py"
-
         policy="$NPU_CI_RUNTIME/policy.json"
-
-        "$python" -B "$helper" lifecycle --policy "$policy" ack --work "$NPU_CI_WORK" --outcome "$NPU_UPLOAD_OUTCOME" --artifact-id
-        "$NPU_ARTIFACT_ID" --artifact-digest "$NPU_ARTIFACT_DIGEST" --accuracy "$NPU_ACCURACY" --performance "$NPU_PERFORMANCE"
-
-        '
+        "$python" -B "$helper" lifecycle --policy "$policy" ack --work "$NPU_CI_WORK" --outcome "$NPU_UPLOAD_OUTCOME" --artifact-id "$NPU_ARTIFACT_ID" --artifact-digest "$NPU_ARTIFACT_DIGEST" --accuracy "$NPU_ACCURACY" --performance "$NPU_PERFORMANCE"
