@@ -1,8 +1,0 @@
-{
-  "schema_version": 1,
-  "artifact_retention_days": 7,
-  "artifact_max_bytes": 1073741824,
-  "upload_attempts": 3,
-  "pending_warning_seconds": 86400,
-  "delete_unarchived": false
-}

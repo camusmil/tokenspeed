@@ -28,16 +28,15 @@ mirrors ``_reference_translation`` in
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import statistics
 import sys
-import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "ci_system/npu"))
-from operator_cli import emit_plan, parse_mode, run_modes
+import pytest
 
 if TYPE_CHECKING:
     import torch
@@ -190,70 +189,6 @@ class VirtualSlotsToLocalTests:
             )
         return False
 
-    def run_accuracy(self) -> int:
-        planned = cases()
-        completed = 0
-        passed = 0
-        current = None
-        emit(
-            "accuracy",
-            "started",
-            expected_cases=len(planned),
-            case_names=[c["name"] for c in planned],
-        )
-        try:
-            if not self.torch.npu.is_available():
-                raise RuntimeError("No NPU device is available")
-            self.torch.npu.set_device(0)
-            for case in planned:
-                current = case["name"]
-                emit("accuracy", "case_started", case=case, dtype=case["dtype"])
-                ok = self.run_case(
-                    case["rows"],
-                    case["degree"],
-                    case["rank"],
-                    getattr(self.torch, case["dtype"]),
-                    case["geometry"],
-                    case["prealloc"],
-                )
-                completed += 1
-                passed += int(ok)
-                emit(
-                    "accuracy",
-                    "case_completed",
-                    case=case,
-                    dtype=case["dtype"],
-                    status="passed" if ok else "failed",
-                )
-                if not ok:
-                    raise AssertionError(f"Accuracy mismatch in case {current}")
-        except Exception as exc:  # pragma: no cover - device dependent
-            traceback.print_exc()
-            emit(
-                "accuracy",
-                "failed",
-                expected_cases=len(planned),
-                completed_cases=completed,
-                passed_cases=passed,
-                failed_cases=completed - passed,
-                current_case=current,
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
-            print(f"[vsl] FAIL: {exc}", flush=True)
-            return 1
-        emit(
-            "accuracy",
-            "completed",
-            expected_cases=len(planned),
-            completed_cases=completed,
-            passed_cases=passed,
-            failed_cases=completed - passed,
-        )
-        ok = passed == len(planned)
-        print(f"[vsl] PASS ({completed} cases)" if ok else "[vsl] FAIL", flush=True)
-        return 0 if ok else 1
-
     def measure(self, op, iters: int, samples: int, config_name: str) -> list[float]:
         for _ in range(WARMUP):
             op()
@@ -338,68 +273,60 @@ class VirtualSlotsToLocalTests:
             performance_verdict="not_evaluated",
         )
 
-    def run_performance(self) -> int:
-        planned = configs()
-        completed = 0
-        current = None
-        emit(
-            "performance",
-            "started",
-            expected_configs=len(planned),
-            config_names=[c["name"] for c in planned],
-        )
-        try:
-            if not self.torch.npu.is_available():
-                raise RuntimeError("No NPU device is available")
-            self.torch.npu.set_device(0)
-            for config in planned:
-                current = config["name"]
-                self.run_config(config)
-                completed += 1
-        except Exception as exc:  # pragma: no cover - device dependent
-            traceback.print_exc()
-            emit(
-                "performance",
-                "failed",
-                expected_configs=len(planned),
-                completed_configs=completed,
-                current_config=current,
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
-            print(f"[vsl-perf] FAIL: {exc}", flush=True)
-            return 1
-        emit(
-            "performance",
-            "completed",
-            expected_configs=len(planned),
-            completed_configs=completed,
-        )
-        print("[vsl-perf] PASS", flush=True)
-        return 0
+
+OPERATOR = "virtual_slots_to_local"
 
 
-def main(argv=None) -> int:
-    args = parse_mode(argv, __doc__)
-    if args.collect_plan:
-        if args.mode != "all":
-            raise ValueError("Plan collection requires --mode all")
-        emit_plan(
-            "virtual_slots_to_local",
-            cases(),
-            configs(),
-            {"warmup": WARMUP, "iterations": ITERS, "sample_count": SAMPLES},
-            lambda c: {"dtype": c["dtype"]},
-            lambda c: {
-                "dtype": "int64",
-                "prealloc": True,
-                "virtual_block_count": c["n"] // c["rows"] + 2,
-            },
-        )
-        return 0
+def accuracy_metadata(case):
+    return {"dtype": case["dtype"]}
+
+
+def performance_metadata(config):
+    return {
+        "dtype": "int64",
+        "prealloc": True,
+        "virtual_block_count": config["n"] // config["rows"] + 2,
+    }
+
+
+@pytest.fixture(scope="module")
+def npu_suite():
+    if importlib.util.find_spec("torch_npu") is None:
+        pytest.skip("torch_npu is not installed")
     suite = VirtualSlotsToLocalTests()
-    return run_modes(args.mode, suite.run_accuracy, suite.run_performance)
+    assert suite.torch.npu.is_available(), "No NPU device is available"
+    suite.torch.npu.set_device(0)
+    return suite
+
+
+@pytest.mark.parametrize("case", cases(), ids=lambda case: case["name"])
+def test_accuracy(case, npu_suite):
+    emit("accuracy", "case_started", case=case, **accuracy_metadata(case))
+    ok = npu_suite.run_case(
+        case["rows"],
+        case["degree"],
+        case["rank"],
+        getattr(npu_suite.torch, case["dtype"]),
+        case["geometry"],
+        case["prealloc"],
+    )
+    emit(
+        "accuracy",
+        "case_completed",
+        case=case,
+        status="passed" if ok else "failed",
+        **accuracy_metadata(case),
+    )
+    assert ok, f"Accuracy mismatch in case {case['name']}"
+
+
+@pytest.mark.parametrize("config", configs(), ids=lambda config: config["name"])
+def test_performance(config, npu_suite):
+    npu_suite.run_config(config)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "test/ci_system/npu"))
+    from pipeline import test_entry
+
+    raise SystemExit(test_entry(Path(__file__)))
