@@ -2294,6 +2294,11 @@ class NpuPytestPlugin:
         self.failures = []
         self.current = None
 
+    def pytest_configure(self, config):
+        # Pytest 8 assertion formatting reads this even without its terminal plugin.
+        if not hasattr(config.option, "verbose"):
+            config.option.verbose = 0
+
     def pytest_collectreport(self, report):
         if report.failed:
             self.failures.append(str(report.longrepr))
