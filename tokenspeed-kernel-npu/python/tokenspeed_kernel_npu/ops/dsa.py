@@ -42,7 +42,7 @@ def _scatter(
     row = tl.program_id(0)
     off = tl.arange(0, BLOCK)
     loc = tl.load(Loc + row).to(tl.int64)
-    x = tl.load(X + row * WIDTH + off, off < WIDTH, other=0)
+    x = tl.load(X + row * WIDTH + off, off < WIDTH, other=0) + 1
     # Null page padding must not race on or corrupt live cache data.
     tl.store(Y + loc * WIDTH + off, x, (off < WIDTH) & (loc >= PAGE) & (loc < CAP))
 
