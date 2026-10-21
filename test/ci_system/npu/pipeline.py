@@ -91,6 +91,8 @@ def load_inputs(repo_root, phase, work):
 
 def stop_process_group(process):
     """Stop the private test process group, including surviving children."""
+    if sys.platform == "linux" and process.poll() is not None:
+        return
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -402,6 +404,7 @@ def handle_interrupt(signum, frame):
 
 def main(argv=None):
     args = parse_args(argv)
+    phase_started = time.monotonic()
     previous_handlers = {}
     previous_pythonpath = os.environ.get("PYTHONPATH")
     try:
@@ -426,6 +429,8 @@ def main(argv=None):
         print("Phase:", args.phase, flush=True)
         print("Python:", sys.executable, flush=True)
         print("Source directory:", root, flush=True)
+        remaining = args.timeout_seconds - (time.monotonic() - phase_started)
+        ci_reporting.require(remaining > 0, "Phase timeout during plan preparation")
         return execute_phase(
             root,
             task,
@@ -434,7 +439,7 @@ def main(argv=None):
             reporting,
             args.phase,
             args.output_dir,
-            args.timeout_seconds,
+            remaining,
             args.github_summary,
         )
     except PhaseInterrupted as exc:

@@ -79,6 +79,10 @@ def utc(timestamp):
 
 def load_policy(path):
     policy = read_json(path)
+    require(
+        policy.get("schema_version") == 1 and policy.get("delete_unarchived") is False,
+        "Unarchived deletion is not permitted",
+    )
     for key in ("jobs_root", "evidence_root", "state_root"):
         directory = Path(policy[key])
         require(
@@ -242,7 +246,7 @@ def evidence_directory(policy, state):
     return Path(policy["evidence_root"]) / f"{state['run_id']}-{state['attempt']}"
 
 
-def collect(policy, work, now):
+def collect(policy, work, now, outcomes):
     work, state = checked_work(policy, work)
     for directory in (
         work / "accuracy",
@@ -272,7 +276,8 @@ def collect(policy, work, now):
     temporary = Path(tempfile.mkdtemp(prefix=".bundle-", dir=output))
     try:
         selected = []
-        succeeded = all(
+        require(set(outcomes) == {"accuracy", "performance"}, "Missing step outcomes")
+        succeeded = all(value == "success" for value in outcomes.values()) and all(
             state["phases"].get(phase, {}).get("exit") == 0
             for phase in ("accuracy", "performance")
         )
@@ -374,6 +379,13 @@ def verify_bundle(bundle):
     manifest = read_json(bundle / "manifest.json")
     require(
         manifest["schema"] == SCHEMA and manifest["files"], "Invalid evidence manifest"
+    )
+    expected_files = {item["path"] for item in manifest["files"]}
+    require(len(expected_files) == len(manifest["files"]), "Duplicate evidence file")
+    require(
+        {str(path.relative_to(bundle)) for path in regular_files(bundle)}
+        == expected_files | {"manifest.json"},
+        "Unexpected evidence files",
     )
     for item in manifest["files"]:
         relative = Path(item["path"])
@@ -583,8 +595,13 @@ def prepare_archive_action(workspace, policy):
             "name": "Collect NPU evidence",
             "id": "collect",
             "shell": "bash",
-            "env": {"NPU_ARCHIVE_WORK": "${{ inputs.work }}"},
-            "run": helper + ' collect --work "$NPU_ARCHIVE_WORK"',
+            "env": {
+                "NPU_ARCHIVE_WORK": "${{ inputs.work }}",
+                "NPU_ACCURACY_OUTCOME": "${{ inputs.accuracy }}",
+                "NPU_PERFORMANCE_OUTCOME": "${{ inputs.performance }}",
+            },
+            "run": helper
+            + ' collect --work "$NPU_ARCHIVE_WORK" --accuracy "$NPU_ACCURACY_OUTCOME" --performance "$NPU_PERFORMANCE_OUTCOME"',
         }
     ]
     for attempt in range(1, policy["upload_attempts"] + 1):
@@ -666,6 +683,8 @@ def cli():
     logger.add_argument("--work", required=True)
     collector = commands.add_parser("collect")
     collector.add_argument("--work", required=True)
+    collector.add_argument("--accuracy", required=True)
+    collector.add_argument("--performance", required=True)
     ack = commands.add_parser("ack")
     for name in (
         "work",
@@ -722,7 +741,12 @@ def cli():
         )
         stream_bootstrap(args.work, sys.stdin.buffer, sys.stdout.buffer)
     elif args.command == "collect":
-        bundle = collect(policy, args.work, now)
+        bundle = collect(
+            policy,
+            args.work,
+            now,
+            {"accuracy": args.accuracy, "performance": args.performance},
+        )
         with Path(os.environ["GITHUB_OUTPUT"]).open("a") as handle:
             handle.write(f"path={bundle}\n")
         print(
