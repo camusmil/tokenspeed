@@ -39,6 +39,8 @@ import time
 import traceback
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ci_system.ci_register import register_npu_ci
 
@@ -517,3 +519,48 @@ def test_qwen3_npu_smoke():
             handle.write(
                 "Smoke checks execution and bounded nonempty output. Accuracy and performance thresholds are not evaluated.\n"
             )
+
+
+@pytest.mark.parametrize(
+    "response, maximum, vocabulary",
+    [
+        ({"output_ids": [], "meta_info": {}}, 16, 100),
+        ({"output_ids": [True], "meta_info": {}}, 16, 100),
+        ({"output_ids": [-1], "meta_info": {}}, 16, 100),
+        ({"output_ids": [100], "meta_info": {}}, 16, 100),
+        ({"output_ids": [1, 2], "meta_info": {}}, 1, 100),
+        (
+            {
+                "output_ids": [1],
+                "meta_info": {
+                    "completion_tokens": 1,
+                    "finish_reason": {"type": "abort"},
+                },
+            },
+            16,
+            100,
+        ),
+        (
+            {
+                "output_ids": [1],
+                "meta_info": {
+                    "completion_tokens": 2,
+                    "finish_reason": {"type": "stop"},
+                },
+            },
+            16,
+            100,
+        ),
+    ],
+)
+def test_invalid_qwen_output_is_a_failure(response, maximum, vocabulary):
+    with pytest.raises(ValueError):
+        validate_response(response, maximum, vocabulary)
+
+
+def test_qwen_accepts_bounded_tokens_and_valid_finish():
+    response = {
+        "output_ids": [1, 2],
+        "meta_info": {"completion_tokens": 2, "finish_reason": {"type": "stop"}},
+    }
+    assert validate_response(response, 16, 100) == [1, 2]

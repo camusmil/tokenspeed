@@ -1531,3 +1531,38 @@ def test_reporter_is_offline_pinned_and_rejects_tampering(npu_source, tmp_path):
     )
     assert changed.returncode != 0
     assert "Prepared source reporter was modified" in changed.stderr
+
+
+@pytest.mark.parametrize("status, proof_status", [(0, 0), (7, 0), (0, 7)])
+def test_runtime_install_entry_preserves_interpreter_arguments_and_status(
+    tmp_path, status, proof_status
+):
+    from pipeline import normalize_task
+
+    task = normalize_task(REPO_ROOT / "test/ci/ut/ut-runtime-1npu.yaml", REPO_ROOT)
+    interpreter = tmp_path / "bootstrap python"
+    arguments = tmp_path / "arguments.json"
+    interpreter.write_text(
+        f"#!{sys.executable}\n"
+        + f"import json, pathlib, sys\npathlib.Path({str(arguments)!r}).write_text(json.dumps(sys.argv[1:]))\nsys.exit({status})\n"
+    )
+    interpreter.chmod(0o755)
+    proof_python = tmp_path / "model-venv/bin/python"
+    proof_python.parent.mkdir(parents=True)
+    proof_python.write_text(
+        f"#!{sys.executable}\nimport sys\nsys.exit({proof_status})\n"
+    )
+    proof_python.chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-c", task["install"][0]],
+        env=dict(
+            os.environ,
+            NPU_CI_BOOTSTRAP_PYTHON=str(interpreter),
+            NPU_CI_WORK=str(tmp_path),
+            CI_RUNNER_LABEL="tokenspeed-npu-arm64",
+            NPU_CI_RUNTIME="true",
+        ),
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode == (status or proof_status)
+    assert json.loads(arguments.read_text()) == ["-B", "-"]

@@ -103,6 +103,21 @@ class ChangeSelectionTest(unittest.TestCase):
                     select_model_suite("pull_request", {path})["should_run"]
                 )
 
+    def test_shared_runtime_implementation_and_tests_select_model_suite(self):
+        for name in (
+            "process_group_manager.py",
+            "install_deps.sh",
+            "test_pipeline.py",
+            "test_process_group_manager.py",
+            "test_dispatch_workflows.py",
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(
+                    select_model_suite("pull_request", {f"test/ci_system/{name}"})[
+                        "should_run"
+                    ]
+                )
+
     def test_operator_only_and_shared_changes(self):
         path = "ci/npu_ops_test/tests/scatter-test.py"
         self.assertTrue(

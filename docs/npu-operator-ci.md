@@ -232,8 +232,10 @@ with the normal pip resolver. The runtime installation has a 1,800-second limit;
 the smoke test retains its separate 600-second limit. These limits bound
 execution and do not define a performance threshold.
 
-The runtime task YAML invokes `npu_runtime.py install` directly with the
-configured bootstrap Python to prepare an independent `model-venv` under this task's work directory. CANN native/IR
+The runtime task YAML invokes the common `test/ci_system/install_deps.sh`.
+Its explicit NPU branch uses the configured bootstrap Python to prepare an
+independent `model-venv` under this task's work directory, before CUDA/ROCm
+dispatch or package-cache setup. `pipeline.py` prepares the native environment. CANN native/IR
 libraries remain available; CANN Python tooling and automatic CUDA migration
 are excluded. The task installs the full runtime, scheduler extension, shared
 kernel package and NPU kernel package from the exact event checkout. Normal
@@ -252,7 +254,10 @@ and a maximum of 16 generated tokens. The test requires nonempty valid token
 IDs, nonempty decoded output and a consistent `stop` or `length` finish reason.
 This is execution smoke, not an accuracy or performance threshold assessment.
 
-The public pipeline uses an NPU command supervisor for this runtime task. It
+The public pipeline explicitly configures `CommandSupervision` in the common
+`test/ci_system/process_group_manager.py` for this runtime task. NV/AMD retain
+their existing process behavior, including GPU signal-success handling; NPU
+command failures are always propagated, independent of success text in logs. It
 keeps the host lock until the private command group is reclaimed, bounds lock
 wait separately from installation/inference, and observes controller/Runner
 termination. Failed commands stop later stages. The test always attempts
@@ -264,3 +269,13 @@ and `model/` generation results in the same result artifact machinery as the
 operator reports. These remain separate from operator accuracy/performance
 counts. Existing shared artifact overlap and unconditional cleanup findings
 remain unchanged; this addition does not establish upload-failure retention.
+
+The hosted NPU selector runs the shared pipeline, dispatcher and Linux process
+lifecycle regressions before hardware jobs. Regression tests live alongside
+their common implementations; Qwen response validation lives in the model test
+file and runs without model assets on the hosted runner. The hardware suite
+also runs those validation cases along with the real inference test. Linux
+coverage includes lock contention, execution deadlines, command failures and
+controller death. Supervisor evidence errors fail the command and still release
+the lock after process cleanup. No persistent GPU runner ledger is used for
+supervised commands.

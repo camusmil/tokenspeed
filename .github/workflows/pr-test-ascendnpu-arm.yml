@@ -139,6 +139,22 @@ jobs:
                   output.write(f"{name}={json.dumps({'include': items})}\n")
           PYTHON
 
+      - name: Test shared CI and Linux command lifecycle
+        if: steps.changes.outputs.should_run == 'true' || steps.changes.outputs.model_should_run == 'true'
+        env:
+          PYTHONPATH: .:test/ci_system
+        run: |
+          python3 -m pip install 'pytest>=9,<10'
+          python3 -B -m pytest --noconftest -q \
+            test/ci_system/test_pipeline.py \
+            test/ci_system/test_ci_path_filter.py \
+            test/ci_system/test_process_group_manager.py \
+            test/ci_system/test_dispatch_workflows.py \
+            test/ci_system/test_package_cache.py \
+            test/ci_system/test_cuda_install_validation.py \
+            test/runtime/models/test_qwen3_npu_smoke.py::test_invalid_qwen_output_is_a_failure \
+            test/runtime/models/test_qwen3_npu_smoke.py::test_qwen_accepts_bounded_tokens_and_valid_finish
+
   npu:
     name: Ascend NPU ARM operator tests
     needs: select

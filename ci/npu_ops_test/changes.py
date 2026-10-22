@@ -160,7 +160,11 @@ def select_model_suite(event_name: str, paths: set[str]) -> dict:
         "test/ci_system/ci_register.py",
         "test/ci_system/ci_utils.py",
         "test/ci_system/pipeline.py",
-        "test/ci_system/npu_runtime.py",
+        "test/ci_system/process_group_manager.py",
+        "test/ci_system/install_deps.sh",
+        "test/ci_system/test_pipeline.py",
+        "test/ci_system/test_process_group_manager.py",
+        "test/ci_system/test_dispatch_workflows.py",
         ".github/workflows/pr-test-ascendnpu-arm.yml",
         ".github/workflows/run-ci-task-matrix.yml",
     )

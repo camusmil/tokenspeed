@@ -1,7 +1,9 @@
 import json
 import re
 import runpy
+import shutil
 import subprocess
+import sys
 import textwrap
 from contextlib import nullcontext
 from pathlib import Path
@@ -10,6 +12,7 @@ from unittest.mock import Mock
 
 import pipeline
 import pytest
+from ci_register import DeviceBackend, collect_tests
 from pipeline import (
     STALE_PROCESS_PATTERNS,
     build_matrix,
@@ -33,12 +36,14 @@ from pipeline import (
     is_cpu_only_runner,
     is_gb200_runner,
     is_nvidia_arm_runner,
+    normalize_task,
     parse_args,
     poll_readiness,
     resolve_score_threshold_for_runner,
     runner_matches_group,
     setup_runner,
     should_run_nvidia_gpu_cleanup,
+    summarize_task_targets,
     validate_task,
     wrap_command_with_log,
 )
@@ -493,7 +498,7 @@ def test_slurm_server_modes_split_server_from_client(monkeypatch, tmp_path):
 
 def test_slurm_setup_is_scoped_to_job_id(monkeypatch, tmp_path):
     class FakeProcessGroupManager:
-        def __init__(self, runner_id):
+        def __init__(self, runner_id, *, supervision):
             self.runner_id = runner_id
 
     monkeypatch.setattr(pipeline, "ProcessGroupManager", FakeProcessGroupManager)
@@ -515,7 +520,7 @@ def test_slurm_setup_is_scoped_to_job_id(monkeypatch, tmp_path):
 
 def test_slurm_setup_isolates_overlapping_steps(monkeypatch, tmp_path):
     class FakeProcessGroupManager:
-        def __init__(self, runner_id):
+        def __init__(self, runner_id, *, supervision):
             self.runner_id = runner_id
 
     monkeypatch.setattr(pipeline, "ProcessGroupManager", FakeProcessGroupManager)
@@ -2006,3 +2011,131 @@ def test_stale_torch_extension_cleanup_fails_if_lock_survives(tmp_path, monkeypa
 def test_jit_cache_env_keeps_explicit_overrides():
     env = {"RUNNER_NAME": "gb200-1gpu-0", "TRITON_CACHE_DIR": "/mnt/triton"}
     assert "TRITON_CACHE_DIR" not in get_jit_cache_env(env)
+
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "test/runtime/models/test_qwen3_npu_smoke.py"
+
+
+def test_npu_runtime_is_registered_separately_from_cuda():
+    entries = collect_tests([str(SCRIPT)], sanity_check=True)
+    assert len(entries) == 1
+    assert entries[0].backend == DeviceBackend.NPU
+    assert entries[0].suite == "runtime-1npu"
+    runner = runpy.run_path(str(ROOT / "test/runtime/run_ci_suite.py"))
+    assert runner["filter_tests"](entries, DeviceBackend.CUDA, "runtime-1gpu") == (
+        [],
+        [],
+    )
+    assert (
+        runner["filter_tests"](entries, DeviceBackend.NPU, "runtime-1npu")[0] == entries
+    )
+
+
+def test_runtime_yaml_resolves_through_public_pipeline():
+    task = normalize_task(ROOT / "test/ci/ut/ut-runtime-1npu.yaml", ROOT)
+    targets = summarize_task_targets(task, ROOT)
+    assert "test/runtime/models/test_qwen3_npu_smoke.py" in targets["test_files"]
+    matrix = build_matrix(
+        ROOT / "test/ci",
+        ROOT,
+        "per-commit",
+        runner_group="npu",
+        workflow_stage="unit-test",
+    )
+    tasks = {item["name"]: item for item in matrix["include"]}
+    assert tasks["ut-runtime-1npu"]["npu_runtime"] is True
+    assert tasks["npu-operators"]["npu_runtime"] is False
+    for group in ("nvidia", "amd"):
+        gpu = build_matrix(
+            ROOT / "test/ci",
+            ROOT,
+            "per-commit",
+            runner_group=group,
+            workflow_stage="unit-test",
+        )
+        assert all(item["name"] not in tasks for item in gpu["include"])
+
+
+def test_empty_npu_suite_fails_without_changing_cuda_empty_suite(tmp_path):
+    runtime = tmp_path / "test/runtime"
+    registry = tmp_path / "test/ci_system"
+    runtime.mkdir(parents=True)
+    registry.mkdir()
+    shutil.copy2(ROOT / "test/runtime/run_ci_suite.py", runtime)
+    shutil.copy2(ROOT / "test/ci_system/ci_register.py", registry)
+    for device, suite, expected in (
+        ("npu", "runtime-1npu", 1),
+        ("cuda", "runtime-1gpu", 0),
+    ):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(runtime / "run_ci_suite.py"),
+                "--device",
+                device,
+                "--suite",
+                suite,
+            ],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == expected, result.stdout + result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux NPU command supervisor")
+@pytest.mark.parametrize("failure_stage", ["install", "ut"])
+def test_npu_runtime_failure_stops_later_commands(tmp_path, monkeypatch, failure_stage):
+    import yaml
+
+    # Only deployment is substituted: the hosted runner has no CANN or ci-npu account.
+    def hosted_environment(env, root, *, dry_run):
+        return dict(env, TOKENSPEED_CI_SOURCE_SHA="1" * 40)
+
+    monkeypatch.setattr(pipeline, "npu_runtime_environment", hosted_environment)
+    (tmp_path / "runtime").mkdir()
+    lock = tmp_path / "host.lock"
+    lock.touch()
+    task = {
+        "api_version": "ci.tokenspeed.io/v1",
+        "name": "failure-propagation",
+        "type": "ut",
+        "workflow_stage": "unit-test",
+        "triggers": ["manual"],
+        "runner": {"labels": ["tokenspeed-npu-arm64"]},
+        "env": {
+            "NPU_CI_RUNTIME": "true",
+            "NPU_CI_WORK": str(tmp_path),
+            "NPU_CI_LOCK": str(lock),
+            "NPU_CI_LOCK_TIMEOUT": "1",
+            "NPU_CI_INSTALL_TIMEOUT": "5",
+            "NPU_CI_TEST_TIMEOUT": "5",
+        },
+        "install": ["exit 7" if failure_stage == "install" else "true"],
+        "ut": {"commands": ["exit 7", "touch must-not-start"]},
+    }
+    path = tmp_path / "task.yaml"
+    path.write_text(yaml.safe_dump(task))
+    result = tmp_path / "result.json"
+    assert (
+        pipeline.execute_task(
+            config="task.yaml",
+            runner="tokenspeed-npu-arm64",
+            work_dir=str(tmp_path),
+            dry_run=False,
+            print_plan=False,
+            result_json=str(result),
+        )
+        != 0
+    )
+    assert not (tmp_path / "must-not-start").exists()
+    if failure_stage == "install":
+        assert not (tmp_path / "runtime/ut.process.json").exists()
+    proof = json.loads((tmp_path / f"runtime/{failure_stage}.process.json").read_text())
+    assert proof["exit_code"] == 7
+    import fcntl
+
+    with lock.open("r+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)

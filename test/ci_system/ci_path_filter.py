@@ -67,7 +67,6 @@ VENDOR_PATHS = {
     ),
     "npu": (
         "test/runtime/models/test_qwen3_npu_smoke.py",
-        "test/ci_system/npu_runtime.py",
         "test/ci_system/install_triton_ascend.sh",
         "test/ci_system/verify_triton_ascend.py",
     ),
