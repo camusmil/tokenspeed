@@ -211,6 +211,12 @@ cannot modify. It contains deployment paths only, not tasks or executable code:
 }
 ```
 
+The wheel directory may also contain verified ARM64 build dependencies such as
+CMake. Both build-system and runtime dependency resolution use this directory
+with the normal pip resolver. The runtime installation has a 1,800-second limit;
+the smoke test retains its separate 600-second limit. These limits bound
+execution and do not define a performance threshold.
+
 `install_deps_npu.sh` and the small `npu_runtime.py` environment adapter prepare
 an independent `model-venv` under this task's work directory. CANN native/IR
 libraries remain available; CANN Python tooling and automatic CUDA migration

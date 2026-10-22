@@ -221,6 +221,8 @@ def install_runtime():
             "1",
             "--index-url",
             "https://pypi.org/simple",
+            "--find-links",
+            wheels,
             *sorted(requirements),
         ],
         check=True,
