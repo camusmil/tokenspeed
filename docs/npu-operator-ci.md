@@ -30,6 +30,15 @@ The workflow has no top-level path filter, so unrelated changes still produce a 
 The caller passes the selected `test/ci/ut/npu-operators.yaml` task to `.github/workflows/run-ci-task-matrix.yml`, using the dedicated NPU runner label. This shared workflow invokes `test/ci_system/pipeline.py` in the existing NPU environment; the task has no dependency-install stage or Docker requirement.
 NPU CI implementation and operator tests remain under `ci/npu_ops_test/`; new operators do not require changes to GPU task lists.
 
+
+## GitHub source reads and retries
+
+A full operator-and-runtime run uses three isolated source checkouts: one hosted selector checkout and one checkout for each hardware task. Accuracy and performance reuse the operator checkout; runtime installation and execution reuse the runtime checkout. There is no shared mutable checkout or cross-run source cache.
+
+Every NPU source fetch and GitHub API command makes at most four attempts: the initial attempt plus three retries, with 30 seconds between failed attempts. Cancellation does not retry. Git failures retain their original output and final exit code. API commands retain their 120-second per-attempt limit; invalid JSON, incomplete change lists and changed PR identity still fail selection. This policy covers repository Git/API reads authored by the NPU workflow, not Runner-managed Action downloads, artifact transport or package installation.
+
+Before installation or tests, each hardware job prepares `.github/scripts/ci_result_source.py` from the immutable `github.workflow_sha`. When that commit is already in the source checkout, preparation is entirely local. If it differs and is unavailable, it is fetched with the same retry policy before testing. The reporter is copied outside the checkout and its Git blob ID is retained; the final source-recording step verifies that ID before running it. No GitHub download is performed during NPU source recording after tests. Reporter preparation or verification failures fail the job; source verification is never silently skipped after successful preparation.
+
 ## Components and execution order
 
 - `ci/npu_ops_test/changes.py`: validates the manifest and event identity, then selects relevant changes.
@@ -48,7 +57,7 @@ The executor starts each manifest `script` with `--mode accuracy` or `--mode per
 The standalone `--mode all` option is a convenience for one operator only. CI does not use it: CI preserves the global ordering of all accuracy tests before any performance test.
 Before invoking the pipeline, the shared workflow validates NPU deployment, platform, and event inputs, creates an isolated run/attempt directory, and checks out the requested SHA. `NPU_CI_WORK` identifies that directory; commands run from its `checkout/` directory.
 Performance reuses the directory only after accuracy succeeds. Both commands retain the existing Linux, ARM64, SHA, and clean-checkout checks, host lock, fixed environment, and cache preparation in `run_step.sh`.
-The shared workflow checks out the requested SHA with `actions/checkout` and does not persist checkout credentials for NPU tasks.
+The NPU paths fetch the exact requested SHA using public HTTPS Git reads without checkout credentials. Non-NPU tasks retain their existing checkout actions.
 The interpreter path is fixed. Scripts use that interpreter with `-B -u`, and the two kernel package directories in the checkout precede other entries in `PYTHONPATH`.
 
 | Operator | Accuracy cases | Performance configurations | Performance samples |

@@ -104,6 +104,11 @@ class ChangeSelectionTest(unittest.TestCase):
             select_suite(self.manifest, "pull_request", {path})["should_run"]
         )
         self.assertFalse(select_model_suite("pull_request", {path})["should_run"])
+        path = "ci/npu_ops_test/github.py"
+        self.assertTrue(
+            select_suite(self.manifest, "pull_request", {path})["should_run"]
+        )
+        self.assertTrue(select_model_suite("pull_request", {path})["should_run"])
         path = "tokenspeed-kernel-npu/topic.py"
         self.assertTrue(
             select_suite(self.manifest, "pull_request", {path})["should_run"]

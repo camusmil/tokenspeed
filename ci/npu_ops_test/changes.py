@@ -26,8 +26,12 @@ import argparse
 import json
 import re
 import subprocess
+import sys
 from fnmatch import fnmatchcase
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from ci.npu_ops_test.github import run_github
 
 
 def load_manifest(path: Path) -> dict:
@@ -104,6 +108,7 @@ def select_suite(manifest: dict, event_name: str, paths: set[str]) -> dict:
 
 def select_model_suite(event_name: str, paths: set[str]) -> dict:
     model_paths = (
+        "ci/npu_ops_test/github.py",
         "python/**",
         "tokenspeed-scheduler/**",
         "tokenspeed-kernel/python/**",
@@ -141,9 +146,7 @@ def github_json(endpoint, *, paginate):
     command = ["gh", "api", endpoint]
     if paginate:
         command += ["--paginate", "--slurp"]
-    result = subprocess.run(
-        command, check=True, capture_output=True, text=True, timeout=120
-    )
+    result = run_github(command, cwd=None, timeout_seconds=120, capture_output=True)
     return json.loads(result.stdout)
 
 

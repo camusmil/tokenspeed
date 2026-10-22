@@ -54,11 +54,44 @@ jobs:
       model_matrix: ${{ steps.scan.outputs.model_matrix || '{"include":[]}' }}
     steps:
       - name: Check out event commit
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 1
-          persist-credentials: false
+        env:
+          NPU_SOURCE_SHA: ${{ github.sha }}
+          NPU_SOURCE_DIR: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          export GIT_TERMINAL_PROMPT=0
+          [[ "$GITHUB_SERVER_URL" = https://github.com ]] || { echo 'Unsupported GitHub server' >&2; exit 1; }
+          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || exit 1
+          [[ "$NPU_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'An immutable checkout SHA is required' >&2; exit 1; }
+          mkdir -p "$NPU_SOURCE_DIR"
+          [[ -z "$(ls -A "$NPU_SOURCE_DIR")" ]] || { echo 'Checkout directory must be empty' >&2; exit 1; }
+          git init "$NPU_SOURCE_DIR"
+          cd "$NPU_SOURCE_DIR"
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          # Bootstrap runs before repository helpers are available.
+          for attempt in 1 2 3 4; do
+            echo "GitHub source fetch attempt $attempt/4"
+            if git -c credential.helper= -c http.extraheader= fetch --no-tags --depth=1 origin "$NPU_SOURCE_SHA"; then
+              break
+            else
+              status=$?
+              echo "GitHub source fetch attempt $attempt/4 failed (exit=$status)" >&2
+              case "$status" in 130|143) exit "$status" ;; esac
+              [[ "$attempt" != 4 ]] || exit "$status"
+              echo 'Retrying GitHub read in 30 seconds' >&2
+              sleep 30
+            fi
+          done
+          git checkout --detach "$NPU_SOURCE_SHA"
+          [[ "$(git rev-parse HEAD)" = "$NPU_SOURCE_SHA" ]] || exit 1
+          [[ -z "$(git status --porcelain --untracked-files=all)" ]] || { echo 'Checkout is not clean' >&2; exit 1; }
+          if [[ -n "${NPU_REPORTER_DIR:-}" ]]; then
+            python3 -B ci/npu_ops_test/github.py --repo "$PWD" \
+              --workflow-sha "$NPU_WORKFLOW_SHA" --directory "$NPU_REPORTER_DIR" \
+              --github-env "$GITHUB_ENV"
+          fi
       - name: Select operator and runtime tests
         id: changes
         shell: bash
