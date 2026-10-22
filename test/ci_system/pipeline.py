@@ -2095,6 +2095,9 @@ def execute_task(
                         command, str(command_result.get("output", ""))
                     )
                 )
+                if is_npu_runner(runner):
+                    # Raw diagnostics already have one supervised phase log.
+                    command_result.pop("output", None)
                 command_results.append(command_result)
                 if enable_perf_diagnostics and stage_name == "perf":
                     run_perf_diagnostics(
