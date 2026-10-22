@@ -763,6 +763,10 @@ def setup_runner(
     if is_npu_runner(runner):
         if setup_mode != "ci":
             raise ValueError("NPU tasks require setup-mode=ci")
+        # YAML commands use the same prepared interpreter as the controller.
+        local_env["PATH"] = (
+            f"{Path(sys.executable).parent}{os.pathsep}{local_env['PATH']}"
+        )
         return local_env, pgm
 
     if setup_mode == "slurm":
