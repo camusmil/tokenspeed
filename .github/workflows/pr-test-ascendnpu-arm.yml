@@ -25,144 +25,142 @@ name: PR Test Ascend NPU ARM
     branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+    inputs:
+      run_model_validation:
+        description: Run model validation before automatic model CI is enabled
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
-  group: pr-test-npu-arm-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'high priority' && format('-ignored-label-{0}', github.run_id) || '' }}
+  group: pr-test-npu-arm-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  select:
+  scan:
     name: Check Ascend NPU ARM changes
     if: |
       (github.repository == 'lightseekorg/tokenspeed' ||
        github.repository == vars.TOKENSPEED_NPU_CI_REPOSITORY) &&
-      github.event.deleted != true &&
-      (github.event.action != 'labeled' || github.event.label.name == 'high priority')
+      github.event.deleted != true
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       should_run: ${{ steps.changes.outputs.should_run }}
       reason: ${{ steps.changes.outputs.reason }}
+      matrix: ${{ steps.changes.outputs.matrix }}
+      timeout_minutes: ${{ steps.changes.outputs.timeout_minutes }}
+      model_should_run: ${{ steps.changes.outputs.model_should_run }}
+      model_matrix: ${{ steps.changes.outputs.model_matrix }}
+      model_timeout_minutes: ${{ steps.changes.outputs.model_timeout_minutes }}
+      model_allowed: ${{ steps.changes.outputs.model_allowed }}
+      checkout_ref: ${{ github.sha }}
     steps:
-      - name: Check out event commit and full history
+      - name: Check out event commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 0
           persist-credentials: false
-      - name: Select operator tests
+      - name: Select operator and model tasks
         id: changes
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPU_ARM_CI_ENABLED: ${{ vars.TOKENSPEED_NPU_ARM_CI_ENABLED }}
+          NPU_MODEL_CI_ENABLED: ${{ vars.TOKENSPEED_NPU_ARM_MODEL_CI_ENABLED }}
+          NPU_MODEL_VALIDATION: ${{ github.event_name == 'workflow_dispatch' && inputs.run_model_validation == true }}
+          NPU_ARM_RUNNER_NAME: ${{ vars.TOKENSPEED_NPU_ARM_RUNNER_NAME }}
+          NPU_PR_IS_DRAFT: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == true }}
         run: |
           set -euo pipefail
-          python3 -B -m unittest ci.npu_ops_test.test_changes
-          python3 -B ci/npu_ops_test/changes.py \
+          python3 -m pip install PyYAML==6.0.3
+          python3 -B test/ci_system/npu/ci_path_filter.py \
             --repo-root "$GITHUB_WORKSPACE" \
-            --manifest ci/npu_ops_test/manifest.json \
+            --task test/ci/ut/npu-operators.yaml \
+            --task test/ci/ut/ut-runtime-qwen-smoke-1npu.yaml \
             --event-name "$GITHUB_EVENT_NAME" \
             --event-path "$GITHUB_EVENT_PATH" \
-            --checkout-sha "$GITHUB_SHA" \
-            --checkout-ref "$GITHUB_REF" \
+            --repository "$GITHUB_REPOSITORY" \
             --github-output "$GITHUB_OUTPUT" \
             | tee "$RUNNER_TEMP/npu-change-selection.json"
+          python3 -B - "$RUNNER_TEMP/npu-change-selection.json" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
 
-  npu:
-    name: Ascend NPU ARM operator tests
-    needs: select
+          selection = json.loads(Path(sys.argv[1]).read_text())
+          enabled = os.environ["NPU_ARM_CI_ENABLED"].lower() == "true"
+          draft = os.environ["NPU_PR_IS_DRAFT"] == "true"
+          runner_name_configured = bool(os.environ["NPU_ARM_RUNNER_NAME"].strip())
+          model_allowed = os.environ["NPU_MODEL_CI_ENABLED"].lower() == "true" or os.environ["NPU_MODEL_VALIDATION"] == "true"
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              output.write(f"model_allowed={str(model_allowed).lower()}\n")
+          decisions = {}
+          for stage, selected in selection["stages"].items():
+              reasons = []
+              if not selected["should_run"]:
+                  reasons.append(selected["reason"])
+              if not enabled:
+                  reasons.append("hardware-disabled")
+              if draft:
+                  reasons.append("draft-pr")
+              if stage == "model" and not model_allowed:
+                  reasons.append("model-disabled")
+              action = "skip" if reasons else "request-runner"
+              if action == "request-runner" and not runner_name_configured:
+                  action = "fail"
+                  reasons.append("missing-runner-name")
+              decisions[stage] = {
+                  "hardware_action": action, "reasons": reasons,
+                  "selection_reason": selected["reason"], "should_run": selected["should_run"],
+                  "hardware_enabled": enabled, "draft_pr": draft,
+                  "required_runner_label": "ascend-npu-ops-test", "runner_name_configured": runner_name_configured,
+              }
+          print(json.dumps(decisions, indent=2), flush=True)
+          summary = ["### Ascend NPU ARM scheduling decision", "", "| Stage | Decision | Reasons |", "| --- | --- | --- |"]
+          summary.extend(f"| {stage} | `{decision['hardware_action']}` | `{json.dumps(decision['reasons'])}` |" for stage, decision in decisions.items())
+          summary.extend(["", "Requesting a runner does not mean tests have run. Both selected tasks run in operator-then-model order; operator failure or cancellation blocks the model.", ""])
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as output:
+              output.write("\n".join(summary))
+          if any(decision["hardware_action"] == "fail" for decision in decisions.values()):
+              raise SystemExit("Repository variable TOKENSPEED_NPU_ARM_RUNNER_NAME must be configured")
+          PY
+
+  operator-tests:
+    needs: scan
     if: |
       vars.TOKENSPEED_NPU_ARM_CI_ENABLED == 'true' &&
-      needs.select.outputs.should_run == 'true' &&
+      needs.scan.outputs.should_run == 'true' &&
+      needs.scan.outputs.matrix != '{"include": []}' &&
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    runs-on: tokenspeed-npu-arm64
-    env:
-      TOKENSPEED_NPU_CI_REPOSITORY: ${{ vars.TOKENSPEED_NPU_CI_REPOSITORY }}
-      TOKENSPEED_NPU_ARM_RUNNER_NAME: ${{ vars.TOKENSPEED_NPU_ARM_RUNNER_NAME }}
-    timeout-minutes: 60
-    steps:
-      - name: Run accuracy tests for all operators
-        id: accuracy
-        shell: bash
-        env:
-          NPU_PHASE: accuracy
-        # The bootstrap must live here: the repository script is not available yet.
-        run: &npu-bootstrap |
-          set -Eeuo pipefail
-          stage=bootstrap
-          started=$SECONDS
-          finish() {
-            rc=$?
-            trap - EXIT
-            if (( rc != 0 )); then
-              message="ARM NPU ${NPU_PHASE}: ${stage} failed (exit=${rc})"
-              printf '::error::%s\n' "$message"
-              printf '\n### ARM NPU phase failed\n\nPhase: `%s`; stage: `%s`; exit: `%s`. See the raw logs in this step.\n' \
-                "$NPU_PHASE" "$stage" "$rc" >> "$GITHUB_STEP_SUMMARY" || rc=1
-            fi
-            printf 'ARM NPU phase finished: %s, exit=%s, elapsed=%ss\n' "$NPU_PHASE" "$rc" "$((SECONDS-started))"
-            exit "$rc"
-          }
-          trap finish EXIT
-          trap 'exit 130' INT
-          trap 'exit 143' TERM
-          require_equal() {
-            printf 'Checking %s: actual=%s; expected=%s\n' "$1" "$3" "$2"
-            [[ "$2" = "$3" ]] || { printf '%s does not match the deployment contract\n' "$1" >&2; return 1; }
-          }
-          echo "ARM NPU phase started: $NPU_PHASE"
-          stage=deployment-contract
-          [[ -n "${TOKENSPEED_NPU_ARM_RUNNER_NAME:-}" ]] || { echo 'Repository variable TOKENSPEED_NPU_ARM_RUNNER_NAME must be configured' >&2; exit 1; }
-          require_equal runner "$TOKENSPEED_NPU_ARM_RUNNER_NAME" "$RUNNER_NAME"
-          require_equal server https://github.com "$GITHUB_SERVER_URL"
-          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$ ]] || { echo 'Invalid GITHUB_REPOSITORY format' >&2; exit 1; }
-          [[ "${GITHUB_REPOSITORY#*/}" != . && "${GITHUB_REPOSITORY#*/}" != .. ]] || { echo 'Invalid GITHUB_REPOSITORY name' >&2; exit 1; }
-          [[ "$GITHUB_REPOSITORY" = lightseekorg/tokenspeed || ( -n "${TOKENSPEED_NPU_CI_REPOSITORY:-}" && "$GITHUB_REPOSITORY" = "$TOKENSPEED_NPU_CI_REPOSITORY" ) ]] || { echo 'GITHUB_REPOSITORY is not in the repository allowlist' >&2; exit 1; }
-          # Reject a mislabelled x86 runner before fetching or executing test code.
-          stage=platform
-          require_equal system Linux "$(uname -s)"
-          architecture=$(uname -m)
-          echo "Checking architecture: $architecture"
-          case "$architecture" in aarch64|arm64) ;; *) echo 'An ARM64 runner is required' >&2; exit 1 ;; esac
-          stage=runner-contract
-          require_equal user ci-npu "$(id -un)"
-          require_equal runner_environment self-hosted "$RUNNER_ENVIRONMENT"
-          stage=validate-event
-          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid GITHUB_SHA format' >&2; exit 1; }
-          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]] || { echo 'Invalid run_id/attempt format' >&2; exit 1; }
-          git check-ref-format "$GITHUB_REF"
-          if [[ "$NPU_PHASE" = accuracy ]]; then
-            stage=checkout
-            work=$(mktemp -d "/srv/npu-ci/jobs/slot0/actions-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.XXXXXXXX")
-            echo "Run directory: $work"
-            printf 'NPU_CI_WORK=%s\n' "$work" >> "$GITHUB_ENV"
-            git init -q "$work/checkout"
-            # Public repository: do not forward credentials into PR test processes.
-            GIT_TERMINAL_PROMPT=0 git -C "$work/checkout" -c credential.helper= \
-              fetch --no-tags --depth=1 \
-              "https://github.com/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
-            git -C "$work/checkout" -c core.hooksPath=/dev/null checkout -q --detach FETCH_HEAD
-            printf 'repository=%s\nsha=%s\nref=%s\nrun_id=%s\nattempt=%s\n' \
-              "$GITHUB_REPOSITORY" "$GITHUB_SHA" "$GITHUB_REF" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
-              | tee "$work/source.txt"
-          else
-            work="${NPU_CI_WORK:?Missing accuracy checkout}"
-            [[ "$work" == /srv/npu-ci/jobs/slot0/actions-"${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}".* ]] || { echo 'Run directory does not match run_id/attempt' >&2; exit 1; }
-          fi
-          stage=verify-checkout
-          actual_sha=$(git -C "$work/checkout" rev-parse HEAD)
-          require_equal checkout_sha "$GITHUB_SHA" "$actual_sha"
-          status=$(git -C "$work/checkout" status --porcelain --untracked-files=all)
-          [[ -z "$status" ]] || { echo 'Checkout contains modified or untracked files' >&2; exit 1; }
-          stage=run-phase
-          bash "$work/checkout/ci/npu_ops_test/run_step.sh" "$NPU_PHASE" "$work"
-      - name: Run performance tests for all operators
-        id: performance
-        if: ${{ success() }}
-        shell: bash
-        env:
-          NPU_PHASE: performance
-        run: *npu-bootstrap
+    uses: ./.github/workflows/run-ci-task-matrix.yml
+    with:
+      install_tokenspeed_mla_from_source: "${{ 'false' }}"
+      matrix: ${{ needs.scan.outputs.matrix }}
+      checkout_ref: ${{ needs.scan.outputs.checkout_ref }}
+      timeout_minutes: ${{ fromJSON(needs.scan.outputs.timeout_minutes) }}
+
+  model-smoke:
+    needs: [scan, operator-tests]
+    if: |
+      always() && !cancelled() &&
+      needs.scan.result == 'success' &&
+      (needs.operator-tests.result == 'success' ||
+       (needs.operator-tests.result == 'skipped' && needs.scan.outputs.should_run == 'false')) &&
+      vars.TOKENSPEED_NPU_ARM_CI_ENABLED == 'true' &&
+      needs.scan.outputs.model_should_run == 'true' &&
+      needs.scan.outputs.model_allowed == 'true' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    uses: ./.github/workflows/run-ci-task-matrix.yml
+    with:
+      install_tokenspeed_mla_from_source: "${{ 'false' }}"
+      matrix: ${{ needs.scan.outputs.model_matrix }}
+      checkout_ref: ${{ needs.scan.outputs.checkout_ref }}
+      timeout_minutes: ${{ fromJSON(needs.scan.outputs.model_timeout_minutes) }}

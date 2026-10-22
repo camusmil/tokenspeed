@@ -28,16 +28,15 @@ negatives, out-of-range) leaves the cache untouched.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import statistics
 import sys
-import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from operator_cli import parse_mode, run_modes
+import pytest
 
 if TYPE_CHECKING:
     import torch
@@ -181,63 +180,6 @@ class ScatterTests:
             print(f"    cache[{row},{col}] actual={got} expected={want}")
         return False
 
-    def run_accuracy(self) -> int:
-        planned = cases()
-        completed = 0
-        passed = 0
-        current = None
-        emit(
-            "accuracy",
-            "started",
-            expected_cases=len(planned),
-            case_names=[c["name"] for c in planned],
-        )
-        try:
-            if not self.torch.npu.is_available():
-                raise RuntimeError("No NPU device is available")
-            self.torch.npu.set_device(0)
-            for case in planned:
-                current = case["name"]
-                emit("accuracy", "case_started", case=case, dtype="bfloat16")
-                ok = self.run_case(case)
-                completed += 1
-                passed += int(ok)
-                emit(
-                    "accuracy",
-                    "case_completed",
-                    case=case,
-                    dtype="bfloat16",
-                    status="passed" if ok else "failed",
-                )
-                if not ok:
-                    raise AssertionError(f"Accuracy mismatch in case {current}")
-        except Exception as exc:  # pragma: no cover - device dependent
-            traceback.print_exc()
-            emit(
-                "accuracy",
-                "failed",
-                expected_cases=len(planned),
-                completed_cases=completed,
-                passed_cases=passed,
-                failed_cases=completed - passed,
-                current_case=current,
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
-            print(f"[scatter] FAIL: {exc}", flush=True)
-            return 1
-        emit(
-            "accuracy",
-            "completed",
-            expected_cases=len(planned),
-            completed_cases=completed,
-            passed_cases=passed,
-            failed_cases=completed - passed,
-        )
-        ok = passed == len(planned)
-        print("[scatter] PASS" if ok else "[scatter] FAIL", flush=True)
-        return 0 if ok else 1
-
     def measure(self, op, iters: int, samples: int, config_name: str) -> list:
         for _ in range(WARMUP):
             op()
@@ -312,52 +254,59 @@ class ScatterTests:
             performance_verdict="not_evaluated",
         )
 
-    def run_performance(self) -> int:
-        planned = configs()
-        completed = 0
-        current = None
-        emit(
-            "performance",
-            "started",
-            expected_configs=len(planned),
-            config_names=[c["name"] for c in planned],
-        )
-        try:
-            if not self.torch.npu.is_available():
-                raise RuntimeError("No NPU device is available")
-            self.torch.npu.set_device(0)
-            for config in planned:
-                current = config["name"]
-                self.run_config(config)
-                completed += 1
-        except Exception as exc:  # pragma: no cover - device dependent
-            traceback.print_exc()
-            emit(
-                "performance",
-                "failed",
-                expected_configs=len(planned),
-                completed_configs=completed,
-                current_config=current,
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
-            print(f"[scatter-perf] FAIL: {exc}", flush=True)
-            return 1
-        emit(
-            "performance",
-            "completed",
-            expected_configs=len(planned),
-            completed_configs=completed,
-        )
-        print("[scatter-perf] PASS", flush=True)
-        return 0
+
+OPERATOR = "scatter"
 
 
-def main(argv=None) -> int:
-    mode = parse_mode(argv, __doc__)
+def accuracy_metadata(case):
+    return {"dtype": "bfloat16"}
+
+
+def performance_metadata(config):
+    return {"dtype": "bfloat16", "page": 1}
+
+
+@pytest.fixture(scope="module")
+def npu_suite():
+    if importlib.util.find_spec("torch_npu") is None:
+        pytest.skip("torch_npu is not installed")
     suite = ScatterTests()
-    return run_modes(mode, suite.run_accuracy, suite.run_performance)
+    assert suite.torch.npu.is_available(), "No NPU device is available"
+    suite.torch.npu.set_device(0)
+    return suite
+
+
+@pytest.mark.parametrize("case", cases(), ids=lambda case: case["name"])
+def test_accuracy(case, npu_suite):
+    emit("accuracy", "case_started", case=case, **accuracy_metadata(case))
+    try:
+        ok = npu_suite.run_case(case)
+    except Exception:
+        emit(
+            "accuracy",
+            "case_completed",
+            case=case,
+            status="failed",
+            **accuracy_metadata(case),
+        )
+        raise
+    emit(
+        "accuracy",
+        "case_completed",
+        case=case,
+        status="passed" if ok else "failed",
+        **accuracy_metadata(case),
+    )
+    assert ok, f"Accuracy mismatch in case {case['name']}"
+
+
+@pytest.mark.parametrize("config", configs(), ids=lambda config: config["name"])
+def test_performance(config, npu_suite):
+    npu_suite.run_config(config)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "test/ci_system/npu"))
+    from lifecycle import test_entry
+
+    raise SystemExit(test_entry(Path(__file__)))

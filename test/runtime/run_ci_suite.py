@@ -31,10 +31,12 @@ from ci_system.ci_utils import run_unittest_files
 
 DEVICE_MAPPING = {
     "cuda": DeviceBackend.CUDA,
+    "npu": DeviceBackend.NPU,
 }
 
 # Per-commit test suites (run on every PR)
 PER_COMMIT_SUITES = {
+    DeviceBackend.NPU: ["runtime-1npu"],
     DeviceBackend.CUDA: [
         "runtime-1gpu",
         "runtime-2gpu",
@@ -166,6 +168,9 @@ def run_a_suite(args):
     pretty_print_tests(args, ci_tests, skipped_tests)
 
     if len(ci_tests) == 0:
+        if device == DeviceBackend.NPU:
+            print("Required NPU suite selected no tests.", file=sys.stderr)
+            return 1
         print("No tests to run. Exiting with success.", flush=True)
         return 0
 

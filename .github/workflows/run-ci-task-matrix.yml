@@ -53,6 +53,13 @@ jobs:
     timeout-minutes: ${{ matrix.runner == 'amd-mi45x-cpu-test' && 30 || inputs.timeout_minutes }}
     continue-on-error: ${{ matrix.optional }}
     env:
+      TOKENSPEED_NPU_CI_REPOSITORY: ${{ vars.TOKENSPEED_NPU_CI_REPOSITORY }}
+      TOKENSPEED_NPU_ARM_RUNNER_NAME: ${{ vars.TOKENSPEED_NPU_ARM_RUNNER_NAME }}
+      NPU_CI_RUNTIME: /srv/npu-ci/runtime/shared-qwen-v1
+      NPU_CHECKOUT_REF: ${{ inputs.checkout_ref || github.sha }}
+      NPU_TASK_TYPE: ${{ matrix.npu_kind == 'operator' && 'ut' || 'model_smoke' }}
+      NPU_TASK_CONFIG: ${{ matrix.config }}
+      NPU_TASK_RUNNER: ${{ matrix.runner }}
       INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.install_tokenspeed_mla_from_source }}
       BASE_REF: ${{ inputs.comparison_base_ref }}
       CANDIDATE_REF: ${{ inputs.comparison_candidate_ref }}
@@ -64,7 +71,24 @@ jobs:
       # Cross-repository PRs cannot receive repository secrets.
       TOKENSPEED_CI_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
     steps:
+      - name: Prepare exact task source
+        if: matrix.runner == 'ascend-npu-ops-test'
+        id: prepare
+        shell: bash
+        env:
+          NPU_TASK_CONFIG: ${{ matrix.config }}
+          NPU_TASK_NAME: ${{ matrix.name }}
+          NPU_TASK_RUNNER: ${{ matrix.runner }}
+          NPU_JOB_MINUTES: ${{ inputs.timeout_minutes }}
+        run: |
+          set -Eeuo pipefail
+          python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
+          helper="$NPU_CI_RUNTIME/lifecycle.py"
+          policy="$NPU_CI_RUNTIME/policy.json"
+          "$python" -B "$helper" prepare --policy "$policy" --config "$NPU_TASK_CONFIG" --name "$NPU_TASK_NAME" --runner "$NPU_TASK_RUNNER" --type "$NPU_TASK_TYPE" --timeout-minutes "$NPU_JOB_MINUTES"
+
       - name: Checkout code
+        if: matrix.runner != 'ascend-npu-ops-test'
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref || github.sha }}
@@ -73,6 +97,7 @@ jobs:
           path: run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}
 
       - name: Set work directory
+        if: matrix.runner != 'ascend-npu-ops-test'
         run: |
           work_dir="${{ github.workspace }}/run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}"
           echo "WORK_DIR=$work_dir" >> "$GITHUB_ENV"
@@ -112,6 +137,7 @@ jobs:
           key: mi450-sim-${{ runner.os }}-rocjitsu-9083cc2a-rocm-20260822-v1
 
       - name: Install pipeline dependency
+        if: matrix.runner != 'ascend-npu-ops-test'
         # pypi.org occasionally returns "Content-Type: Unknown" for the simple
         # index, which strict pip>=22 refuses to parse. Retry a few times.
         run: |
@@ -123,6 +149,7 @@ jobs:
           exit 1
 
       - name: Install CI task
+        if: matrix.runner != 'ascend-npu-ops-test'
         run: |
           cd "${{ env.WORK_DIR }}"
           mkdir -p .ci-artifacts
@@ -148,6 +175,7 @@ jobs:
           key: ${{ steps.mi450-simulator-cache.outputs.cache-primary-key }}
 
       - name: Execute CI task
+        if: matrix.runner != 'ascend-npu-ops-test'
         run: |
           cd "${{ env.WORK_DIR }}"
           mkdir -p .ci-artifacts
@@ -161,7 +189,7 @@ jobs:
             --result-json .ci-artifacts/result.json
 
       - name: Checkout source reporter
-        if: always()
+        if: ${{ always() && matrix.runner != 'ascend-npu-ops-test' }}
         uses: actions/checkout@v7
         with:
           ref: ${{ github.workflow_sha }}
@@ -171,7 +199,7 @@ jobs:
           persist-credentials: false
 
       - name: Record checked-out source
-        if: always()
+        if: ${{ always() && matrix.runner != 'ascend-npu-ops-test' }}
         env:
           EXPECTED_SOURCE: ${{ inputs.checkout_ref || github.sha }}
           CONFIG: ${{ matrix.config }}
@@ -181,8 +209,184 @@ jobs:
           --work-dir "$WORK_DIR" --expected "$EXPECTED_SOURCE"
           --config "$CONFIG" --runner "$RUNNER"
 
+      - name: Run operator accuracy
+        if: ${{ matrix.npu_kind == 'operator' }}
+        id: accuracy
+        shell: bash
+        env:
+          NPU_PHASE: accuracy
+        run: |
+          set -Eeuo pipefail
+          python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
+          helper="$NPU_CI_RUNTIME/lifecycle.py"
+          policy="$NPU_CI_RUNTIME/policy.json"
+          finish() {
+            rc=$?
+            trap - EXIT
+            "$python" -B "$helper" lifecycle --policy "$policy" phase --work "$NPU_CI_WORK" --phase "$NPU_PHASE" --stage run-phase --exit "$rc" || rc=1
+            exit "$rc"
+          }
+          trap finish EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          cd "$NPU_CI_WORK/checkout"
+          "$python" -B test/ci_system/pipeline.py execute \
+            --config "$NPU_TASK_CONFIG" --runner "$NPU_TASK_RUNNER" \
+            --work-dir "$PWD" --only-stage ut --keep-runner-state \
+            --result-json "$NPU_CI_WORK/accuracy/pipeline-result.json"
+
+      - name: Run operator performance
+        if: ${{ matrix.npu_kind == 'operator' }}
+        id: performance
+        shell: bash
+        env:
+          NPU_PHASE: performance
+        run: |
+          set -Eeuo pipefail
+          python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
+          helper="$NPU_CI_RUNTIME/lifecycle.py"
+          policy="$NPU_CI_RUNTIME/policy.json"
+          finish() {
+            rc=$?
+            trap - EXIT
+            "$python" -B "$helper" lifecycle --policy "$policy" phase --work "$NPU_CI_WORK" --phase "$NPU_PHASE" --stage run-phase --exit "$rc" || rc=1
+            exit "$rc"
+          }
+          trap finish EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          cd "$NPU_CI_WORK/checkout"
+          "$python" -B test/ci_system/pipeline.py execute \
+            --config "$NPU_TASK_CONFIG" --runner "$NPU_TASK_RUNNER" \
+            --work-dir "$PWD" --only-stage ut --keep-runner-state \
+            --result-json "$NPU_CI_WORK/performance/pipeline-result.json"
+
+      - name: Prepare model runtime
+        id: runtime
+        if: ${{ matrix.npu_kind == 'model' }}
+        shell: bash
+        env:
+          NPU_PHASE: runtime
+        run: |
+          set -Eeuo pipefail
+          python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
+          helper="$NPU_CI_RUNTIME/lifecycle.py"
+          policy="$NPU_CI_RUNTIME/policy.json"
+          finish() {
+            rc=$?
+            trap - EXIT
+            "$python" -B "$helper" lifecycle --policy "$policy" phase --work "$NPU_CI_WORK" --phase "$NPU_PHASE" --stage prepare-model-runtime --exit "$rc" || rc=1
+            exit "$rc"
+          }
+          trap finish EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          cd "$NPU_CI_WORK/checkout"
+          "$python" -B test/ci_system/pipeline.py execute \
+            --config "$NPU_TASK_CONFIG" --runner "$NPU_TASK_RUNNER" \
+            --work-dir "$PWD" --only-stage install --keep-runner-state \
+            --result-json "$NPU_CI_WORK/runtime/pipeline-result.json"
+
+      - name: Run registered NPU model suite
+        id: model
+        if: ${{ matrix.npu_kind == 'model' }}
+        shell: bash
+        env:
+          NPU_PHASE: model
+        run: |
+          set -Eeuo pipefail
+          python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
+          helper="$NPU_CI_RUNTIME/lifecycle.py"
+          policy="$NPU_CI_RUNTIME/policy.json"
+          finish() {
+            rc=$?
+            trap - EXIT
+            "$python" -B "$helper" lifecycle --policy "$policy" phase --work "$NPU_CI_WORK" --phase "$NPU_PHASE" --stage run-model --exit "$rc" || rc=1
+            exit "$rc"
+          }
+          trap finish EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          cd "$NPU_CI_WORK/checkout"
+          "$python" -B test/ci_system/pipeline.py execute \
+            --config "$NPU_TASK_CONFIG" --runner "$NPU_TASK_RUNNER" \
+            --work-dir "$PWD" --only-stage ut --keep-runner-state \
+            --result-json "$NPU_CI_WORK/model/pipeline-result.json"
+
+      - name: Prepare evidence
+        id: collect
+        if: ${{ always() && matrix.runner == 'ascend-npu-ops-test' && env.NPU_CI_WORK != '' }}
+        shell: bash
+        env:
+          NPU_ACCURACY: ${{ steps.accuracy.outcome }}
+          NPU_PERFORMANCE: ${{ steps.performance.outcome }}
+          NPU_RUNTIME: ${{ steps.runtime.outcome }}
+          NPU_MODEL: ${{ steps.model.outcome }}
+        run: |
+          set -Eeuo pipefail
+          python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
+          helper="$NPU_CI_RUNTIME/lifecycle.py"
+          policy="$NPU_CI_RUNTIME/policy.json"
+          outcomes=$("$python" -c 'import json,os; phases=("accuracy","performance") if os.environ["NPU_TASK_TYPE"]=="ut" else ("runtime","model"); print(json.dumps({p:os.environ["NPU_"+p.upper()] for p in phases}))')
+          "$python" -B "$helper" lifecycle --policy "$policy" collect --work "$NPU_CI_WORK" --outcomes "$outcomes"
+
+      - name: Upload evidence (attempt 1)
+        id: upload1
+        if: ${{ always() && steps.collect.outcome == 'success' && fromJSON(steps.collect.outputs.upload_attempts) >= 1 }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: npu-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}-upload-1
+          path: ${{ steps.collect.outputs.path }}
+          retention-days: ${{ fromJSON(steps.collect.outputs.retention_days) }}
+          if-no-files-found: error
+          include-hidden-files: false
+
+      - name: Upload evidence (attempt 2)
+        id: upload2
+        if: ${{ always() && steps.collect.outcome == 'success' && steps.upload1.outcome != 'success' && fromJSON(steps.collect.outputs.upload_attempts) >= 2 }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: npu-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}-upload-2
+          path: ${{ steps.collect.outputs.path }}
+          retention-days: ${{ fromJSON(steps.collect.outputs.retention_days) }}
+          if-no-files-found: error
+          include-hidden-files: false
+
+      - name: Upload evidence (attempt 3)
+        id: upload3
+        if: ${{ always() && steps.collect.outcome == 'success' && steps.upload1.outcome != 'success' && steps.upload2.outcome != 'success' && fromJSON(steps.collect.outputs.upload_attempts) >= 3 }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: npu-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}-upload-3
+          path: ${{ steps.collect.outputs.path }}
+          retention-days: ${{ fromJSON(steps.collect.outputs.retention_days) }}
+          if-no-files-found: error
+          include-hidden-files: false
+
+      - name: Confirm archive and clean task
+        if: ${{ always() && steps.collect.outcome == 'success' }}
+        shell: bash
+        env:
+          NPU_ACCURACY: ${{ steps.accuracy.outcome }}
+          NPU_PERFORMANCE: ${{ steps.performance.outcome }}
+          NPU_RUNTIME: ${{ steps.runtime.outcome }}
+          NPU_MODEL: ${{ steps.model.outcome }}
+          NPU_UPLOAD_OUTCOME: ${{ (steps.upload1.outcome == 'success' || steps.upload2.outcome == 'success' || steps.upload3.outcome == 'success') && 'success' || 'failure' }}
+          NPU_ARTIFACT_ID: ${{ (steps.upload1.outcome == 'success' && steps.upload1.outputs.artifact-id) || (steps.upload2.outcome == 'success' && steps.upload2.outputs.artifact-id) || (steps.upload3.outcome == 'success' && steps.upload3.outputs.artifact-id) || '' }}
+          NPU_ARTIFACT_DIGEST: ${{ (steps.upload1.outcome == 'success' && steps.upload1.outputs.artifact-digest) || (steps.upload2.outcome == 'success' && steps.upload2.outputs.artifact-digest) || (steps.upload3.outcome == 'success' && steps.upload3.outputs.artifact-digest) || '' }}
+        run: |
+          set -Eeuo pipefail
+          python=/srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python
+          helper="$NPU_CI_RUNTIME/lifecycle.py"
+          policy="$NPU_CI_RUNTIME/policy.json"
+          outcomes=$("$python" -c 'import json,os; phases=("accuracy","performance") if os.environ["NPU_TASK_TYPE"]=="ut" else ("runtime","model"); print(json.dumps({p:os.environ["NPU_"+p.upper()] for p in phases}))')
+          "$python" -B "$helper" lifecycle --policy "$policy" ack --work "$NPU_CI_WORK" --outcome "$NPU_UPLOAD_OUTCOME" --artifact-id "$NPU_ARTIFACT_ID" --artifact-digest "$NPU_ARTIFACT_DIGEST" --outcomes "$outcomes"
+
       - name: Upload task result
-        if: always()
+        if: ${{ always() && matrix.runner != 'ascend-npu-ops-test' }}
         uses: actions/upload-artifact@v4
         with:
           name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -193,7 +397,7 @@ jobs:
           include-hidden-files: true
 
       - name: Upload task logs on failure
-        if: failure()
+        if: ${{ failure() && matrix.runner != 'ascend-npu-ops-test' }}
         uses: actions/upload-artifact@v4
         with:
           name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}-logs
@@ -204,7 +408,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Cleanup work directory
-        if: always()
+        if: ${{ always() && matrix.runner != 'ascend-npu-ops-test' }}
         run: |
           case "${{ matrix.runner }}" in
             gb200*) python3 "${{ env.WORK_DIR }}/test/ci_system/process_group_manager.py" cleanup-stale || true ;;

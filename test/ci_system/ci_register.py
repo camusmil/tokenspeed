@@ -26,6 +26,7 @@ __all__ = [
     "collect_tests",
     "auto_partition",
     "register_cuda_ci",
+    "register_npu_ci",
     "ut_parse_one_file",
 ]
 
@@ -42,6 +43,7 @@ _UNSET = object()
 
 class DeviceBackend(Enum):
     CUDA = auto()
+    NPU = auto()
 
 
 @dataclass
@@ -72,7 +74,20 @@ def register_cuda_ci(
     return None
 
 
+def register_npu_ci(
+    est_time: float,
+    suite: str,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    disabled_on_runners: Optional[List[str]] = None,
+    disabled_on_runners_reason: Optional[str] = None,
+):
+    """Marker for NPU CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
 REGISTER_MAPPING = {
+    "register_npu_ci": DeviceBackend.NPU,
     "register_cuda_ci": DeviceBackend.CUDA,
 }
 

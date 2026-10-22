@@ -1,0 +1,80 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-runtime-qwen-smoke-1npu
+type: ut
+workflow_stage: unit-test
+triggers:
+- per-commit
+- manual
+runner:
+  labels:
+  - ascend-npu-ops-test
+env:
+  CI: 'true'
+  PYTEST_ADDOPTS: -x -p no:cacheprovider
+report:
+  github_step_summary: true
+npu:
+  schema_version: 1
+  resources:
+    architecture: aarch64
+    device_ids:
+    - 0
+    exclusive_host: true
+  cleanup:
+    delete_unarchived: false
+    pending_warning_seconds: 86400
+  watch_paths:
+  - python/**
+  - tokenspeed-scheduler/**
+  - tokenspeed-kernel/python/**
+  - tokenspeed-kernel-npu/**
+  - test/runtime/models/test_qwen3_npu_smoke.py
+  - test/ci/ut/ut-runtime-qwen-smoke-1npu.yaml
+  - test/ci_system/npu/**
+  - .github/workflows/pr-test-ascendnpu-arm.yml
+  - .github/workflows/run-ci-task-matrix.yml
+  - test/ci_system/pipeline.py
+  - test/ci_system/ci_path_filter.py
+  - test/runtime/run_ci_suite.py
+  - test/ci_system/ci_register.py
+  - test/ci_system/ci_utils.py
+  - test/runtime/conftest.py
+  - test/runtime/models/conftest.py
+  - test/conftest.py
+  execution:
+    phases:
+    - runtime
+    - model
+    fail_fast: true
+  timeouts:
+    lock_wait_seconds: 600
+    phase_execution_seconds: 600
+    runtime_install_seconds: 900
+    job_minutes: 90
+  script: test/runtime/models/test_qwen3_npu_smoke.py
+  model:
+    id: Qwen/Qwen3-0.6B
+    revision: c1899de289a04d12100db370d81485cdf75e47ca
+    manifest_sha256: 5a25b58f54e9e74b4c1dce7f5ef8514bcf4e974afeaf2f5dc39e710250bd2d21
+    dtype: bfloat16
+    device: npu
+    device_count: 1
+    tp_size: 1
+    dp_size: 1
+    pp_size: 1
+    prompt: The capital of France is
+    max_new_tokens: 16
+    seed: 0
+    verdict: smoke_only
+    sampling_backend: greedy
+    temperature: 0.0
+  kind: model
+  archive:
+    artifact_retention_days: 7
+    artifact_max_bytes: 1073741824
+    upload_attempts: 3
+install:
+- python3 -B test/ci_system/npu/lifecycle.py model-runtime --policy "$NPU_CI_RUNTIME/policy.json" --work "$NPU_CI_WORK"
+ut:
+  commands:
+  - python3 -B test/runtime/run_ci_suite.py --device npu --suite runtime-1npu --timeout-per-file 600
