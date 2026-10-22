@@ -27,14 +27,15 @@ from ci_system.ci_register import (
     auto_partition,
     collect_tests,
 )
-from ci_system.ci_utils import run_unittest_files
 
 DEVICE_MAPPING = {
     "cuda": DeviceBackend.CUDA,
+    "npu": DeviceBackend.NPU,
 }
 
 # Per-commit test suites (run on every PR)
 PER_COMMIT_SUITES = {
+    DeviceBackend.NPU: ["runtime-1npu"],
     DeviceBackend.CUDA: [
         "runtime-1gpu",
         "runtime-2gpu",
@@ -166,6 +167,9 @@ def run_a_suite(args):
     pretty_print_tests(args, ci_tests, skipped_tests)
 
     if len(ci_tests) == 0:
+        if device == DeviceBackend.NPU:
+            print("No enabled NPU tests found; refusing an empty suite.", flush=True)
+            return 1
         print("No tests to run. Exiting with success.", flush=True)
         return 0
 
@@ -173,6 +177,8 @@ def run_a_suite(args):
     timeout = args.timeout_per_file
     if args.enable_retry:
         timeout += args.retry_timeout_increase
+
+    from ci_system.ci_utils import run_unittest_files
 
     return run_unittest_files(
         ci_tests,

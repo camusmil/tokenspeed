@@ -1,0 +1,40 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-runtime-1npu
+type: ut
+workflow_stage: unit-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - tokenspeed-npu-arm64
+env:
+  CI: "true"
+  NPU_CI_RUNTIME: "true"
+  NPU_CI_DEPLOYMENT: /srv/tokenspeed-npu/runtime-ci.json
+  NPU_CI_LOCK: /srv/npu-ci/locks/host-all.lock
+  NPU_CI_LOCK_TIMEOUT: "600"
+  NPU_CI_INSTALL_TIMEOUT: "900"
+  NPU_CI_TEST_TIMEOUT: "600"
+  NPU_SMOKE_MODEL_ID: Qwen/Qwen3-0.6B
+  NPU_SMOKE_MODEL_REVISION: c1899de289a04d12100db370d81485cdf75e47ca
+  NPU_SMOKE_MANIFEST_SHA256: 5a25b58f54e9e74b4c1dce7f5ef8514bcf4e974afeaf2f5dc39e710250bd2d21
+  NPU_SMOKE_DTYPE: bfloat16
+  NPU_SMOKE_SAMPLING_BACKEND: greedy
+  NPU_SMOKE_TEMPERATURE: "0.0"
+  NPU_SMOKE_DEVICE: npu
+  NPU_SMOKE_DEVICE_COUNT: "1"
+  NPU_SMOKE_TP_SIZE: "1"
+  NPU_SMOKE_DP_SIZE: "1"
+  NPU_SMOKE_PP_SIZE: "1"
+  NPU_SMOKE_PROMPT: The capital of France is
+  NPU_SMOKE_MAX_NEW_TOKENS: "16"
+  NPU_SMOKE_SEED: "0"
+  NPU_SMOKE_PORT: "31811"
+install:
+  - bash test/ci_system/install_deps_npu.sh
+ut:
+  commands:
+    - python3 test/runtime/run_ci_suite.py --device npu --suite runtime-1npu --timeout-per-file 600
+report:
+  github_step_summary: true
