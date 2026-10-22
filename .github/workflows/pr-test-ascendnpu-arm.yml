@@ -50,8 +50,6 @@ jobs:
       should_run: ${{ steps.changes.outputs.should_run }}
       reason: ${{ steps.changes.outputs.reason }}
       matrix: ${{ steps.scan.outputs.matrix || '{"include":[]}' }}
-      model_should_run: ${{ steps.changes.outputs.model_should_run }}
-      model_matrix: ${{ steps.scan.outputs.model_matrix || '{"include":[]}' }}
     steps:
       - name: Check out event commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -59,7 +57,7 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
-      - name: Select operator and runtime tests
+      - name: Select operator tests
         id: changes
         shell: bash
         env:
@@ -78,10 +76,7 @@ jobs:
 
       - name: Scan shared CI tasks
         id: scan
-        if: steps.changes.outputs.should_run == 'true' || steps.changes.outputs.model_should_run == 'true'
-        env:
-          OPERATOR_SELECTED: ${{ steps.changes.outputs.should_run }}
-          MODEL_SELECTED: ${{ steps.changes.outputs.model_should_run }}
+        if: steps.changes.outputs.should_run == 'true'
         run: |
           python3 -m pip install PyYAML==6.0.3
           case "$GITHUB_EVENT_NAME" in
@@ -94,17 +89,7 @@ jobs:
             --repo-root "$GITHUB_WORKSPACE" --runner-group npu \
             --workflow-stage unit-test --trigger "$trigger")
           echo "$matrix" | jq -e '.include | length > 0' >/dev/null
-          export MATRIX="$matrix"
-          python3 - <<'PYTHON'
-          import json, os
-          entries = json.loads(os.environ["MATRIX"])["include"]
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              for name, runtime, selected in (("matrix", False, "OPERATOR_SELECTED"), ("model_matrix", True, "MODEL_SELECTED")):
-                  items = [item for item in entries if item.get("npu_runtime", False) == runtime] if os.environ[selected] == "true" else []
-                  if os.environ[selected] == "true" and not items:
-                      raise ValueError(f"Selected NPU task group is empty: {name}")
-                  output.write(f"{name}={json.dumps({'include': items})}\n")
-          PYTHON
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   npu:
     name: Ascend NPU ARM operator tests
@@ -116,24 +101,6 @@ jobs:
     uses: ./.github/workflows/run-ci-task-matrix.yml
     with:
       matrix: ${{ needs.select.outputs.matrix }}
-      install_tokenspeed_mla_from_source: ${{ 'false' }}
+      install_tokenspeed_mla_from_source: 'false'
       checkout_ref: ${{ github.sha }}
       timeout_minutes: 60
-
-  npu-runtime:
-    name: Ascend NPU ARM runtime smoke
-    needs: [select, npu]
-    if: |
-      always() && !cancelled() &&
-      vars.TOKENSPEED_NPU_ARM_CI_ENABLED == 'true' &&
-      needs.select.result == 'success' &&
-      needs.select.outputs.model_should_run == 'true' &&
-      (needs.npu.result == 'success' ||
-       (needs.npu.result == 'skipped' && needs.select.outputs.should_run != 'true')) &&
-      (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    uses: ./.github/workflows/run-ci-task-matrix.yml
-    with:
-      matrix: ${{ needs.select.outputs.model_matrix }}
-      install_tokenspeed_mla_from_source: ${{ 'false' }}
-      checkout_ref: ${{ github.sha }}
-      timeout_minutes: 90

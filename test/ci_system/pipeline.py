@@ -456,11 +456,6 @@ def build_matrix(
                 "priority": effective,
                 "optional": is_optional,
             }
-            if is_npu_runner(runner):
-                entry["npu_runtime"] = (
-                    str(task.get("env", {}).get("NPU_CI_RUNTIME", "false")).lower()
-                    == "true"
-                )
             if task_workflow_stage is not None:
                 entry["workflow_stage"] = task_workflow_stage
             include.append(entry)
@@ -482,15 +477,6 @@ def shell_run(
     print(f"$ {command}", flush=True)
     if dry_run:
         return {"command": command, "returncode": 0, "output": "", "dry_run": True}
-    if env.get("NPU_CI_RUNTIME") == "true":
-        from npu_runtime import run_shell
-
-        result = run_shell(command, env=env, cwd=cwd)
-        if check and result["returncode"] != 0:
-            raise RuntimeError(
-                f"command failed with exit code {result['returncode']}: {command}"
-            )
-        return result
     process = subprocess.Popen(
         command,
         shell=True,
@@ -792,11 +778,7 @@ def setup_runner(
     if setup_mode != "ci":
         raise ValueError(f"unsupported setup mode: {setup_mode!r}")
     if is_npu_runner(runner):
-        if local_env.get("NPU_CI_RUNTIME") == "true":
-            from npu_runtime import runtime_environment
-
-            local_env = runtime_environment(local_env, cwd, dry_run=dry_run)
-        # Operator phases retain their existing environment and host lock.
+        # The existing NPU entry owns its deployed environment and host lock.
         return local_env, pgm
 
     if is_gb200_runner(runner):
@@ -990,9 +972,9 @@ def _find_registered_runtime_tests(repo_root: Path, suite: str) -> List[str]:
             if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
                 continue
             call = stmt.value
-            if not isinstance(call.func, ast.Name) or call.func.id not in (
-                "register_cuda_ci",
-                "register_npu_ci",
+            if (
+                not isinstance(call.func, ast.Name)
+                or call.func.id != "register_cuda_ci"
             ):
                 continue
             for keyword in call.keywords:
@@ -2064,8 +2046,6 @@ def execute_task(
                         "before perf command", runner_env, repo_root, dry_run
                     )
                 command_env = get_stage_command_env(stage_name, runner_env)
-                if command_env.get("NPU_CI_RUNTIME") == "true":
-                    command_env = dict(command_env, NPU_CI_STAGE=stage_name)
                 if pgm is not None:
                     command_result = pgm.run(
                         command,

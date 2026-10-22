@@ -102,41 +102,6 @@ def select_suite(manifest: dict, event_name: str, paths: set[str]) -> dict:
     }
 
 
-def select_model_suite(event_name: str, paths: set[str]) -> dict:
-    model_paths = (
-        "python/**",
-        "tokenspeed-scheduler/**",
-        "tokenspeed-kernel/python/**",
-        "tokenspeed-kernel-npu/**",
-        "test/runtime/models/test_qwen3_npu_smoke.py",
-        "test/runtime/run_ci_suite.py",
-        "test/ci/ut/ut-runtime-1npu.yaml",
-        "test/ci_system/ci_register.py",
-        "test/ci_system/ci_utils.py",
-        "test/ci_system/pipeline.py",
-        "test/ci_system/npu_runtime.py",
-        "test/ci_system/install_deps_npu.sh",
-        ".github/workflows/pr-test-ascendnpu-arm.yml",
-        ".github/workflows/run-ci-task-matrix.yml",
-    )
-    matched = sorted(
-        path
-        for path in paths
-        if not path.lower().endswith((".md", ".rst"))
-        and any(fnmatchcase(path, pattern) for pattern in model_paths)
-    )
-    selected = event_name == "workflow_dispatch" or bool(matched)
-    return {
-        "should_run": selected,
-        "matched_paths": matched,
-        "reason": (
-            "manual"
-            if event_name == "workflow_dispatch"
-            else ("watched-path-changed" if selected else "no-watched-changes")
-        ),
-    }
-
-
 def github_json(endpoint, *, paginate):
     command = ["gh", "api", endpoint]
     if paginate:
@@ -241,13 +206,10 @@ def main() -> int:
             raise ValueError("Event payload must be an object")
         paths = changed_paths(args.repository, args.event_name, event)
         result = select_suite(manifest, args.event_name, paths)
-        model = select_model_suite(args.event_name, paths)
-        result["model"] = model
         if args.github_output is not None:
             with args.github_output.open("a", encoding="utf-8") as output:
                 output.write(f"should_run={str(result['should_run']).lower()}\n")
                 output.write(f"reason={result['reason']}\n")
-                output.write(f"model_should_run={str(model['should_run']).lower()}\n")
         print(json.dumps(result, indent=2))
         return 0
     except (

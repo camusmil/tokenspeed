@@ -150,7 +150,7 @@ jobs:
           exit 1
 
       - name: Install CI task
-        if: matrix.runner != 'tokenspeed-npu-arm64' || matrix.npu_runtime == true
+        if: matrix.runner != 'tokenspeed-npu-arm64'
         run: |
           cd "${{ env.WORK_DIR }}"
           mkdir -p .ci-artifacts
@@ -212,12 +212,12 @@ jobs:
           --work-dir "$WORK_DIR" --expected "$EXPECTED_SOURCE"
           --config "$CONFIG" --runner "$RUNNER"
 
-      - name: Collect NPU reports
+      - name: Collect NPU operator reports
         if: ${{ always() && matrix.runner == 'tokenspeed-npu-arm64' && env.NPU_CI_WORK != '' }}
         run: |
           destination="$WORK_DIR/.ci-artifacts/published/npu"
           mkdir -p "$destination"
-          for phase in accuracy performance runtime model; do
+          for phase in accuracy performance; do
             if [ -d "$NPU_CI_WORK/$phase" ]; then
               mv "$NPU_CI_WORK/$phase" "$destination/$phase"
             fi

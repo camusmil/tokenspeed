@@ -25,12 +25,7 @@ import subprocess
 import unittest
 from pathlib import Path
 
-from ci.npu_ops_test.changes import (
-    changed_paths,
-    load_manifest,
-    select_model_suite,
-    select_suite,
-)
+from ci.npu_ops_test.changes import changed_paths, load_manifest, select_suite
 
 ROOT = Path(__file__).resolve().parents[2]
 REPOSITORY = "example/tokenspeed"
@@ -83,36 +78,6 @@ class ChangeSelectionTest(unittest.TestCase):
     def select_pr(self, event, api):
         paths = changed_paths(REPOSITORY, "pull_request", event, api=api)
         return select_suite(self.manifest, "pull_request", paths)
-
-    def test_model_only_changes_do_not_select_operators(self):
-        for path in (
-            "test/runtime/models/test_qwen3_npu_smoke.py",
-            "test/ci/ut/ut-runtime-1npu.yaml",
-            "python/tokenspeed/runtime/entrypoints/engine.py",
-        ):
-            with self.subTest(path=path):
-                self.assertFalse(
-                    select_suite(self.manifest, "pull_request", {path})["should_run"]
-                )
-                self.assertTrue(
-                    select_model_suite("pull_request", {path})["should_run"]
-                )
-
-    def test_operator_only_and_shared_changes(self):
-        path = "ci/npu_ops_test/tests/scatter-test.py"
-        self.assertTrue(
-            select_suite(self.manifest, "pull_request", {path})["should_run"]
-        )
-        self.assertFalse(select_model_suite("pull_request", {path})["should_run"])
-        path = "tokenspeed-kernel-npu/topic.py"
-        self.assertTrue(
-            select_suite(self.manifest, "pull_request", {path})["should_run"]
-        )
-        self.assertTrue(select_model_suite("pull_request", {path})["should_run"])
-        self.assertFalse(
-            select_model_suite("pull_request", {"docs/topic.md"})["should_run"]
-        )
-        self.assertTrue(select_model_suite("workflow_dispatch", set())["should_run"])
 
     def test_pr_selection_from_complete_api_files(self):
         for path, watched in (
