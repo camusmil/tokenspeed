@@ -61,7 +61,7 @@ SUPPORTED_SETUP_MODES = ("ci", "slurm")
 # jobs in the same workflow stage contend for the same hardware.
 SUPPORTED_PRIORITIES = ("high", "normal", "low")
 DEFAULT_PRIORITY = "normal"
-SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
+SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86", "npu")
 SUPPORTED_MULTI_NODE_FILTERS = ("all", "only", "exclude")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
@@ -118,6 +118,10 @@ def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
 
 
+def is_npu_runner(runner: str) -> bool:
+    return runner == "tokenspeed-npu-arm64"
+
+
 def is_cpu_only_runner(runner: str) -> bool:
     return CPU_ONLY_RUNNER_MARKER in runner
 
@@ -129,6 +133,10 @@ def is_nvidia_arm_runner(runner: str) -> bool:
 def runner_matches_group(runner: str, runner_group: str) -> bool:
     if runner_group == "all":
         return True
+    if runner_group == "npu":
+        return is_npu_runner(runner)
+    if is_npu_runner(runner):
+        return False
     if runner_group == "amd":
         return is_amd_runner(runner)
     if runner_group == "nvidia":
@@ -448,6 +456,11 @@ def build_matrix(
                 "priority": effective,
                 "optional": is_optional,
             }
+            if is_npu_runner(runner):
+                entry["npu_runtime"] = (
+                    str(task.get("env", {}).get("NPU_CI_RUNTIME", "false")).lower()
+                    == "true"
+                )
             if task_workflow_stage is not None:
                 entry["workflow_stage"] = task_workflow_stage
             include.append(entry)
@@ -469,6 +482,15 @@ def shell_run(
     print(f"$ {command}", flush=True)
     if dry_run:
         return {"command": command, "returncode": 0, "output": "", "dry_run": True}
+    if env.get("NPU_CI_RUNTIME") == "true":
+        from npu_runtime import run_shell
+
+        result = run_shell(command, env=env, cwd=cwd)
+        if check and result["returncode"] != 0:
+            raise RuntimeError(
+                f"command failed with exit code {result['returncode']}: {command}"
+            )
+        return result
     process = subprocess.Popen(
         command,
         shell=True,
@@ -769,6 +791,13 @@ def setup_runner(
         return local_env, pgm
     if setup_mode != "ci":
         raise ValueError(f"unsupported setup mode: {setup_mode!r}")
+    if is_npu_runner(runner):
+        if local_env.get("NPU_CI_RUNTIME") == "true":
+            from npu_runtime import runtime_environment
+
+            local_env = runtime_environment(local_env, cwd, dry_run=dry_run)
+        # Operator phases retain their existing environment and host lock.
+        return local_env, pgm
 
     if is_gb200_runner(runner):
         pgm = make_manager()
@@ -961,9 +990,9 @@ def _find_registered_runtime_tests(repo_root: Path, suite: str) -> List[str]:
             if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
                 continue
             call = stmt.value
-            if (
-                not isinstance(call.func, ast.Name)
-                or call.func.id != "register_cuda_ci"
+            if not isinstance(call.func, ast.Name) or call.func.id not in (
+                "register_cuda_ci",
+                "register_npu_ci",
             ):
                 continue
             for keyword in call.keywords:
@@ -1848,6 +1877,8 @@ def execute_task(
         )
     declared_runner = runner
     runner = apply_slurm_runner_override(declared_runner, runner_override, setup_mode)
+    if is_npu_runner(runner) and (task["type"] != "ut" or setup_mode != "ci"):
+        raise ValueError("NPU operator tasks require type=ut and --setup-mode=ci")
     targets = summarize_task_targets(task, repo_root)
 
     env = merge_env(task.get("env", {}))
@@ -2033,6 +2064,8 @@ def execute_task(
                         "before perf command", runner_env, repo_root, dry_run
                     )
                 command_env = get_stage_command_env(stage_name, runner_env)
+                if command_env.get("NPU_CI_RUNTIME") == "true":
+                    command_env = dict(command_env, NPU_CI_STAGE=stage_name)
                 if pgm is not None:
                     command_result = pgm.run(
                         command,
@@ -2095,7 +2128,7 @@ def execute_task(
         if enable_perf_diagnostics:
             run_perf_diagnostics("before cleanup", runner_env, repo_root, dry_run)
         _stop_managed_server()
-        if setup_mode == "ci" and not keep_runner_state:
+        if setup_mode == "ci" and not keep_runner_state and not is_npu_runner(runner):
             cleanup_runner(runner_env, repo_root, dry_run, pgm)
         if enable_perf_diagnostics:
             run_perf_diagnostics("after cleanup", runner_env, repo_root, dry_run)
