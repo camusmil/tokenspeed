@@ -39,6 +39,12 @@ Every NPU source fetch and GitHub API command makes at most four attempts: the i
 
 Before installation or tests, each hardware job prepares `.github/scripts/ci_result_source.py` from the immutable `github.workflow_sha`. When that commit is already in the source checkout, preparation is entirely local. If it differs and is unavailable, it is fetched with the same retry policy before testing. The reporter is copied outside the checkout and its Git blob ID is retained; the final source-recording step verifies that ID before running it. No GitHub download is performed during NPU source recording after tests. Reporter preparation or verification failures fail the job; source verification is never silently skipped after successful preparation.
 
+The retry helper lives in `ci/npu_ops_test/changes.py`. Reporter preparation is
+the `prepare` command of `.github/scripts/ci_result_source.py`; its original
+source-recording command remains standalone and uses only the Python standard
+library. API regression tests live in `ci/npu_ops_test/test_changes.py`; real Git
+checkout and offline reporter tests live in `test/ci_system/test_dispatch_workflows.py`.
+
 ## Components and execution order
 
 - `ci/npu_ops_test/changes.py`: validates the manifest and event identity, then selects relevant changes.
@@ -226,8 +232,8 @@ with the normal pip resolver. The runtime installation has a 1,800-second limit;
 the smoke test retains its separate 600-second limit. These limits bound
 execution and do not define a performance threshold.
 
-`install_deps_npu.sh` and the small `npu_runtime.py` environment adapter prepare
-an independent `model-venv` under this task's work directory. CANN native/IR
+The runtime task YAML invokes `npu_runtime.py install` directly with the
+configured bootstrap Python to prepare an independent `model-venv` under this task's work directory. CANN native/IR
 libraries remain available; CANN Python tooling and automatic CUDA migration
 are excluded. The task installs the full runtime, scheduler extension, shared
 kernel package and NPU kernel package from the exact event checkout. Normal

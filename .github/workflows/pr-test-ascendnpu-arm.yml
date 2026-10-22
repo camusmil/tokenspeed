@@ -88,7 +88,7 @@ jobs:
           [[ "$(git rev-parse HEAD)" = "$NPU_SOURCE_SHA" ]] || exit 1
           [[ -z "$(git status --porcelain --untracked-files=all)" ]] || { echo 'Checkout is not clean' >&2; exit 1; }
           if [[ -n "${NPU_REPORTER_DIR:-}" ]]; then
-            python3 -B ci/npu_ops_test/github.py --repo "$PWD" \
+            python3 -B .github/scripts/ci_result_source.py prepare --repo "$PWD" \
               --workflow-sha "$NPU_WORKFLOW_SHA" --directory "$NPU_REPORTER_DIR" \
               --github-env "$GITHUB_ENV"
           fi

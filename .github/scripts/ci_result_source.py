@@ -24,7 +24,58 @@ import argparse
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
+
+
+def prepare_reporter(repo: Path, workflow_sha: str, directory: Path, github_env: Path):
+    # Only preparation needs repository helpers; the copied reporter stays standalone.
+    sys.path.insert(0, str(repo.resolve()))
+    from ci.npu_ops_test.changes import run_github
+
+    if not re.fullmatch(r"[0-9a-f]{40}", workflow_sha):
+        raise ValueError("The workflow reporter requires an immutable commit SHA")
+    present = subprocess.run(
+        ["git", "cat-file", "-e", f"{workflow_sha}^{{commit}}"],
+        cwd=repo,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if present.returncode:
+        run_github(
+            [
+                "git",
+                "-c",
+                "credential.helper=",
+                "-c",
+                "http.extraheader=",
+                "fetch",
+                "--no-tags",
+                "--depth=1",
+                "origin",
+                workflow_sha,
+            ],
+            cwd=repo,
+            timeout_seconds=None,
+            capture_output=False,
+        )
+    source = f"{workflow_sha}:.github/scripts/ci_result_source.py"
+    blob = subprocess.check_output(
+        ["git", "rev-parse", source], cwd=repo, text=True
+    ).strip()
+    data = subprocess.check_output(["git", "show", source], cwd=repo)
+    directory.mkdir(parents=True, exist_ok=True)
+    reporter = directory / "source-reporter.py"
+    reporter.write_bytes(data)
+    reporter.chmod(0o400)
+    with github_env.open("a", encoding="utf-8") as output:
+        output.write(
+            f"NPU_SOURCE_REPORTER={reporter}\nNPU_SOURCE_REPORTER_BLOB={blob}\n"
+        )
+    print(
+        f"Prepared source reporter from workflow commit {workflow_sha}, blob {blob}",
+        flush=True,
+    )
 
 
 def write_source(work: Path, expected: str, config: str, runner: str) -> None:
@@ -47,6 +98,24 @@ def write_source(work: Path, expected: str, config: str, runner: str) -> None:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["prepare"]:
+        parser = argparse.ArgumentParser(
+            description="Prepare an offline source reporter"
+        )
+        parser.add_argument("--repo", type=Path, required=True)
+        parser.add_argument("--workflow-sha", required=True)
+        parser.add_argument("--directory", type=Path, required=True)
+        parser.add_argument("--github-env", type=Path, required=True)
+        args = parser.parse_args(sys.argv[2:])
+        try:
+            prepare_reporter(
+                args.repo, args.workflow_sha, args.directory, args.github_env
+            )
+        except subprocess.CalledProcessError as exc:
+            raise SystemExit(
+                exc.returncode if exc.returncode >= 0 else 128 - exc.returncode
+            ) from None
+        raise SystemExit(0)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--expected", required=True)

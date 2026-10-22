@@ -27,11 +27,51 @@ import json
 import re
 import subprocess
 import sys
+import time
 from fnmatch import fnmatchcase
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from ci.npu_ops_test.github import run_github
+
+def run_github(command, *, cwd, timeout_seconds, capture_output):
+    for attempt in range(1, 5):
+        try:
+            return subprocess.run(
+                command,
+                cwd=cwd,
+                timeout=timeout_seconds,
+                capture_output=capture_output,
+                text=True,
+                check=True,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            if isinstance(exc, subprocess.CalledProcessError) and exc.returncode in (
+                -2,
+                -15,
+                130,
+                143,
+            ):
+                raise
+            error = exc.stderr
+            if error:
+                print(
+                    (
+                        error.decode(errors="replace")
+                        if isinstance(error, bytes)
+                        else error
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            print(
+                f"GitHub read attempt {attempt}/4 failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if attempt == 4:
+                raise
+            print("Retrying GitHub read in 30 seconds", file=sys.stderr, flush=True)
+            time.sleep(30)
+    raise AssertionError("Unreachable retry state")
 
 
 def load_manifest(path: Path) -> dict:
@@ -108,7 +148,8 @@ def select_suite(manifest: dict, event_name: str, paths: set[str]) -> dict:
 
 def select_model_suite(event_name: str, paths: set[str]) -> dict:
     model_paths = (
-        "ci/npu_ops_test/github.py",
+        "ci/npu_ops_test/changes.py",
+        ".github/scripts/ci_result_source.py",
         "python/**",
         "tokenspeed-scheduler/**",
         "tokenspeed-kernel/python/**",
@@ -120,7 +161,6 @@ def select_model_suite(event_name: str, paths: set[str]) -> dict:
         "test/ci_system/ci_utils.py",
         "test/ci_system/pipeline.py",
         "test/ci_system/npu_runtime.py",
-        "test/ci_system/install_deps_npu.sh",
         ".github/workflows/pr-test-ascendnpu-arm.yml",
         ".github/workflows/run-ci-task-matrix.yml",
     )

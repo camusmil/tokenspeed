@@ -1,6 +1,9 @@
+import json
 import os
 import shlex
+import shutil
 import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -1297,3 +1300,234 @@ def test_mi450_sim_uses_stock_triton_compatible_libhip_path():
     assert 'libhip_path="${rocm_root}/lib/libamdhip64.so"' in script
     assert 'test -f "${libhip_path}"' in script
     assert 'export TRITON_LIBHIP_PATH="${libhip_path}"' in script
+
+
+def npu_step_script(workflow, job, name):
+    data = yaml.safe_load((REPO_ROOT / ".github/workflows" / workflow).read_text())
+    return next(s["run"] for s in data["jobs"][job]["steps"] if s.get("name") == name)
+
+
+@pytest.fixture
+def npu_source(tmp_path):
+    repo = tmp_path / "repository"
+    repo.mkdir()
+    real_git = shutil.which("git")
+
+    def git(*args):
+        return subprocess.check_output(
+            [real_git, "-C", str(repo), *args], text=True
+        ).strip()
+
+    git("init", "--quiet")
+    git("config", "user.name", "CI fixture")
+    git("config", "user.email", "fixture@example.invalid")
+    for name in ("ci/npu_ops_test/changes.py", ".github/scripts/ci_result_source.py"):
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO_ROOT / name, path)
+    git("add", ".")
+    git("commit", "--quiet", "-m", "workflow reporter")
+    workflow = git("rev-parse", "HEAD")
+    reporter = repo / ".github/scripts/ci_result_source.py"
+    reporter.write_text(
+        reporter.read_text().replace(
+            "    actual = subprocess.run(",
+            "    raise RuntimeError('candidate reporter must not run')\n    actual = subprocess.run(",
+        )
+    )
+    git("add", ".")
+    git("commit", "--quiet", "-m", "candidate source")
+    candidate = git("rev-parse", "HEAD")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "fetch-calls"
+    waits = tmp_path / "waits"
+    wrapper = bin_dir / "git"
+    wrapper.write_text(f"#!{sys.executable}\n" + """
+import os, pathlib, sys
+args = sys.argv[1:]
+if 'fetch' in args:
+    calls = pathlib.Path(os.environ['FETCH_CALLS'])
+    count = int(calls.read_text()) + 1 if calls.exists() else 1
+    calls.write_text(str(count))
+    if count <= int(os.environ.get('FETCH_FAILURES', '0')):
+        print(f'network fixture failure {count}', file=sys.stderr)
+        sys.exit(int(os.environ.get('FETCH_STATUS', '128')))
+os.execv(os.environ['REAL_GIT'], [os.environ['REAL_GIT'], *args])
+""")
+    wrapper.chmod(0o755)
+    sleep = bin_dir / "sleep"
+    sleep.write_text(f"#!{sys.executable}\n" + """
+import os, pathlib, sys, time
+with pathlib.Path(os.environ['WAIT_CALLS']).open('a') as out:
+    out.write(sys.argv[1] + '\\n')
+if os.environ.get('REAL_RETRY_WAIT') == '1':
+    time.sleep(float(sys.argv[1]))
+""")
+    sleep.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "REAL_GIT": real_git,
+        "FETCH_CALLS": str(calls),
+        "WAIT_CALLS": str(waits),
+        "GITHUB_SERVER_URL": "https://github.com",
+        "GITHUB_REPOSITORY": "fixture/tokenspeed",
+        "NPU_SOURCE_SHA": candidate,
+        "NPU_SOURCE_DIR": str(tmp_path / "checkout"),
+        "NPU_WORKFLOW_SHA": candidate,
+        "GITHUB_ENV": str(tmp_path / "github-env"),
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": f"url.{repo.as_uri()}.insteadOf",
+        "GIT_CONFIG_VALUE_0": "https://github.com/fixture/tokenspeed.git",
+    }
+    return env, calls, waits, workflow, candidate
+
+
+@pytest.mark.parametrize("hardware", [False, True])
+@pytest.mark.parametrize(
+    "failures,status", [(0, 128), (3, 128), (4, 128), (1, 130), (1, 143)]
+)
+def test_checkout_retry_exhaustion_and_cancellation(
+    npu_source, hardware, failures, status, tmp_path
+):
+    env, calls, waits, workflow, candidate = npu_source
+    env.update(FETCH_FAILURES=str(failures), FETCH_STATUS=str(status))
+    if hardware:
+        env["NPU_REPORTER_DIR"] = str(tmp_path / "task")
+    script = npu_step_script(
+        "run-ci-task-matrix.yml" if hardware else "pr-test-ascendnpu-arm.yml",
+        "test" if hardware else "select",
+        "Prepare NPU source and reporter" if hardware else "Check out event commit",
+    )
+    result = subprocess.run(
+        ["bash", "-c", script], env=env, text=True, capture_output=True
+    )
+    exhausted = failures == 4
+    cancelled = status in (130, 143)
+    assert result.returncode == (status if exhausted or cancelled else 0), result.stderr
+    assert int(calls.read_text()) == (4 if failures >= 3 else 1)
+    actual_waits = waits.read_text().splitlines() if waits.exists() else []
+    assert actual_waits == (["30"] * (3 if failures >= 3 else 0))
+    if exhausted or cancelled:
+        assert not Path(env["GITHUB_ENV"]).exists()
+        assert "network fixture failure" in result.stderr
+    else:
+        assert (
+            subprocess.check_output(
+                [env["REAL_GIT"], "-C", env["NPU_SOURCE_DIR"], "rev-parse", "HEAD"],
+                text=True,
+            ).strip()
+            == candidate
+        )
+        assert (
+            subprocess.check_output(
+                [env["REAL_GIT"], "-C", env["NPU_SOURCE_DIR"], "status", "--porcelain"],
+                text=True,
+            )
+            == ""
+        )
+        if hardware:
+            assert "NPU_SOURCE_REPORTER=" in Path(env["GITHUB_ENV"]).read_text()
+
+
+def test_missing_workflow_commit_is_fetched_before_tests(npu_source, tmp_path):
+    env, calls, waits, workflow, candidate = npu_source
+    env.update(NPU_REPORTER_DIR=str(tmp_path / "task"), NPU_WORKFLOW_SHA=workflow)
+    script = npu_step_script(
+        "run-ci-task-matrix.yml", "test", "Prepare NPU source and reporter"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script], env=env, text=True, capture_output=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert int(calls.read_text()) == 2
+    assert (
+        "candidate reporter must not run"
+        not in (tmp_path / "task/source-reporter.py").read_text()
+    )
+    assert (
+        subprocess.check_output(
+            [env["REAL_GIT"], "-C", env["NPU_SOURCE_DIR"], "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        == candidate
+    )
+
+
+def test_reporter_is_offline_pinned_and_rejects_tampering(npu_source, tmp_path):
+    env, calls, waits, workflow, candidate = npu_source
+    repo = Path(env["NPU_SOURCE_DIR"])
+    subprocess.run(
+        [env["REAL_GIT"], "clone", "--quiet", str(tmp_path / "repository"), str(repo)],
+        check=True,
+    )
+    subprocess.run(
+        [
+            env["REAL_GIT"],
+            "-C",
+            str(repo),
+            "remote",
+            "set-url",
+            "origin",
+            "https://offline.invalid/repo",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(repo / ".github/scripts/ci_result_source.py"),
+            "prepare",
+            "--repo",
+            str(repo),
+            "--workflow-sha",
+            workflow,
+            "--directory",
+            str(tmp_path / "task"),
+            "--github-env",
+            env["GITHUB_ENV"],
+        ],
+        env=env,
+        check=True,
+    )
+    # Recording must work without any repository retry or selection helper.
+    (repo / "ci/npu_ops_test/changes.py").unlink()
+    assert not calls.exists()
+    values = dict(
+        line.split("=", 1) for line in Path(env["GITHUB_ENV"]).read_text().splitlines()
+    )
+    env.update(
+        values,
+        WORK_DIR=str(repo),
+        EXPECTED_SOURCE=candidate,
+        CONFIG="test/ci/ut/ut-runtime-1npu.yaml",
+        RUNNER="tokenspeed-npu-arm64",
+    )
+    record = npu_step_script(
+        "run-ci-task-matrix.yml", "test", "Record NPU checked-out source"
+    )
+    result = subprocess.run(
+        ["bash", "-c", record], env=env, text=True, capture_output=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert (
+        json.loads((repo / ".ci-artifacts/source.json").read_text())["source_sha"]
+        == candidate
+    )
+    assert not calls.exists()
+    (repo / ".ci-artifacts/source.json").unlink()
+    env["EXPECTED_SOURCE"] = "0" * 40
+    mismatch = subprocess.run(
+        ["bash", "-c", record], env=env, text=True, capture_output=True
+    )
+    assert mismatch.returncode != 0
+    assert not (repo / ".ci-artifacts/source.json").exists()
+    reporter = Path(values["NPU_SOURCE_REPORTER"])
+    reporter.chmod(0o600)
+    reporter.write_text("raise RuntimeError('changed')\n")
+    changed = subprocess.run(
+        ["bash", "-c", record], env=env, text=True, capture_output=True
+    )
+    assert changed.returncode != 0
+    assert "Prepared source reporter was modified" in changed.stderr

@@ -277,3 +277,28 @@ def test_controller_sigkill_reclaims_descendants_and_lock(tmp_path):
         if owner.poll() is None:
             owner.kill()
             owner.wait(timeout=5)
+
+
+@pytest.mark.parametrize("status", [0, 7])
+def test_runtime_install_entry_preserves_interpreter_arguments_and_status(
+    tmp_path, status
+):
+    task = normalize_task(ROOT / "test/ci/ut/ut-runtime-1npu.yaml", ROOT)
+    interpreter = tmp_path / "bootstrap python"
+    arguments = tmp_path / "arguments.json"
+    interpreter.write_text(
+        f"#!{sys.executable}\n"
+        + f"import json, pathlib, sys\npathlib.Path({str(arguments)!r}).write_text(json.dumps(sys.argv[1:]))\nsys.exit({status})\n"
+    )
+    interpreter.chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-c", task["install"][0]],
+        env=dict(os.environ, NPU_CI_BOOTSTRAP_PYTHON=str(interpreter)),
+        cwd=ROOT,
+    )
+    assert result.returncode == status
+    assert json.loads(arguments.read_text()) == [
+        "-B",
+        "test/ci_system/npu_runtime.py",
+        "install",
+    ]

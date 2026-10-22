@@ -32,7 +32,9 @@ env:
   NPU_SMOKE_SEED: "0"
   NPU_SMOKE_PORT: "31811"
 install:
-  - bash test/ci_system/install_deps_npu.sh
+  - |
+    set -Eeuo pipefail
+    exec "$NPU_CI_BOOTSTRAP_PYTHON" -B test/ci_system/npu_runtime.py install
 ut:
   commands:
     - python3 test/runtime/run_ci_suite.py --device npu --suite runtime-1npu --timeout-per-file 600
