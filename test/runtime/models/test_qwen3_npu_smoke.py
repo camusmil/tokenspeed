@@ -39,6 +39,11 @@ import time
 import traceback
 from pathlib import Path
 
+from ci_system.ci_register import register_npu_ci
+
+register_npu_ci(est_time=300, suite="runtime-1npu")
+CI_MODELS = ["Qwen/Qwen3-0.6B"]
+
 
 def positive_seconds(value):
     value = int(value)
@@ -459,3 +464,43 @@ if __name__ == "__main__":
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
     raise SystemExit(worker(args))
+
+
+def test_qwen3_npu_smoke():
+    """Run the pinned offline Qwen model inside the supervised NPU task."""
+    context = json.loads(Path(os.environ["NPU_MODEL_CONTEXT"]).read_text())
+    model = context["model"]
+    deployment = context["deployment"]
+    values = {
+        "source-root": context["source_root"],
+        "source-sha": context["source_sha"],
+        "install-evidence": context["install_evidence"],
+        "model": deployment["path"],
+        "model-id": model["id"],
+        "model-revision": model["revision"],
+        "manifest-sha256": model["manifest_sha256"],
+        **{
+            key.replace("_", "-"): model[key]
+            for key in (
+                "dtype",
+                "sampling_backend",
+                "temperature",
+                "device",
+                "device_count",
+                "tp_size",
+                "dp_size",
+                "pp_size",
+                "prompt",
+                "max_new_tokens",
+                "seed",
+            )
+        },
+        "port": context["port"],
+        "output-dir": context["output_dir"],
+    }
+    argv = [part for key, value in values.items() for part in (f"--{key}", str(value))]
+    args = parse_args(argv)
+    args.output_dir.mkdir(parents=True, exist_ok=False)
+    code = worker(args)
+    result = json.loads((args.output_dir / "result.json").read_text())
+    assert code == 0, result

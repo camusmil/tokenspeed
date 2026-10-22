@@ -79,10 +79,11 @@ jobs:
           NPU_PR_IS_DRAFT: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == true }}
         run: |
           set -euo pipefail
+          python3 -m pip install PyYAML==6.0.3
           python3 -B test/ci_system/npu/ci_path_filter.py \
             --repo-root "$GITHUB_WORKSPACE" \
-            --task test/ci/npu_test/ut-tokenspeed-kernel-npu.json \
-            --task test/ci/npu_test/qwen-npu-smoke.json \
+            --task test/ci/ut/npu-operators.yaml \
+            --task test/ci/ut/ut-runtime-qwen-smoke-1npu.yaml \
             --event-name "$GITHUB_EVENT_NAME" \
             --event-path "$GITHUB_EVENT_PATH" \
             --repository "$GITHUB_REPOSITORY" \
@@ -139,8 +140,9 @@ jobs:
       needs.scan.outputs.should_run == 'true' &&
       needs.scan.outputs.matrix != '{"include": []}' &&
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    uses: ./.github/workflows/run-ci-task-matrix-npu.yml
+    uses: ./.github/workflows/run-ci-task-matrix.yml
     with:
+      install_tokenspeed_mla_from_source: "${{ 'false' }}"
       matrix: ${{ needs.scan.outputs.matrix }}
       checkout_ref: ${{ needs.scan.outputs.checkout_ref }}
       timeout_minutes: ${{ fromJSON(needs.scan.outputs.timeout_minutes) }}
@@ -156,8 +158,9 @@ jobs:
       needs.scan.outputs.model_should_run == 'true' &&
       needs.scan.outputs.model_allowed == 'true' &&
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    uses: ./.github/workflows/run-ci-task-matrix-npu.yml
+    uses: ./.github/workflows/run-ci-task-matrix.yml
     with:
+      install_tokenspeed_mla_from_source: "${{ 'false' }}"
       matrix: ${{ needs.scan.outputs.model_matrix }}
       checkout_ref: ${{ needs.scan.outputs.checkout_ref }}
       timeout_minutes: ${{ fromJSON(needs.scan.outputs.model_timeout_minutes) }}

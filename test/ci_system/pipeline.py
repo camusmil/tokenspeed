@@ -61,7 +61,7 @@ SUPPORTED_SETUP_MODES = ("ci", "slurm")
 # jobs in the same workflow stage contend for the same hardware.
 SUPPORTED_PRIORITIES = ("high", "normal", "low")
 DEFAULT_PRIORITY = "normal"
-SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
+SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86", "npu")
 SUPPORTED_MULTI_NODE_FILTERS = ("all", "only", "exclude")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
@@ -126,7 +126,15 @@ def is_nvidia_arm_runner(runner: str) -> bool:
     return runner.startswith(NVIDIA_ARM_RUNNER_PREFIXES)
 
 
+def is_npu_runner(runner: str) -> bool:
+    return runner == "ascend-npu-ops-test"
+
+
 def runner_matches_group(runner: str, runner_group: str) -> bool:
+    if runner_group == "npu":
+        return is_npu_runner(runner)
+    if is_npu_runner(runner):
+        return False
     if runner_group == "all":
         return True
     if runner_group == "amd":
@@ -450,6 +458,8 @@ def build_matrix(
             }
             if task_workflow_stage is not None:
                 entry["workflow_stage"] = task_workflow_stage
+            if is_npu_runner(runner):
+                entry["npu_kind"] = task["npu"]["kind"]
             include.append(entry)
     # Stable sort: tasks at the same priority keep their file-path / label
     # order, so tasks that omit `priority` see no change from the previous
@@ -750,6 +760,11 @@ def setup_runner(
     local_env = dict(env)
     pgm: Optional[ProcessGroupManager] = None
 
+    if is_npu_runner(runner):
+        if setup_mode != "ci":
+            raise ValueError("NPU tasks require setup-mode=ci")
+        return local_env, pgm
+
     if setup_mode == "slurm":
         job_id = local_env.get("SLURM_JOB_ID")
         if not job_id:
@@ -961,10 +976,10 @@ def _find_registered_runtime_tests(repo_root: Path, suite: str) -> List[str]:
             if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
                 continue
             call = stmt.value
-            if (
-                not isinstance(call.func, ast.Name)
-                or call.func.id != "register_cuda_ci"
-            ):
+            if not isinstance(call.func, ast.Name) or call.func.id not in {
+                "register_cuda_ci",
+                "register_npu_ci",
+            }:
                 continue
             for keyword in call.keywords:
                 if keyword.arg == "suite" and _const_str(keyword.value) == suite:
@@ -991,6 +1006,9 @@ def _extract_ci_models_from_test_file(path: Path) -> List[str]:
         if not isinstance(stmt.value, ast.List):
             continue
         for elt in stmt.value.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                models.append(elt.value)
+                continue
             if not isinstance(elt, ast.Call):
                 continue
             if not isinstance(elt.func, ast.Name) or elt.func.id != "ModelCase":
@@ -1848,6 +1866,12 @@ def execute_task(
         )
     declared_runner = runner
     runner = apply_slurm_runner_override(declared_runner, runner_override, setup_mode)
+    if is_npu_runner(runner):
+        from npu.lifecycle import config_path, load_task
+
+        selected = load_task(repo_root / config)
+        if config_path(selected) != config or task.get("retries", 0):
+            raise ValueError("Invalid NPU task identity or retry policy")
     targets = summarize_task_targets(task, repo_root)
 
     env = merge_env(task.get("env", {}))
@@ -2033,7 +2057,24 @@ def execute_task(
                         "before perf command", runner_env, repo_root, dry_run
                     )
                 command_env = get_stage_command_env(stage_name, runner_env)
-                if pgm is not None:
+                if (
+                    is_npu_runner(runner)
+                    and task["npu"]["kind"] == "model"
+                    and stage_name == "ut"
+                    and not dry_run
+                ):
+                    from npu.lifecycle import run_model
+
+                    model_env = dict(command_env)
+                    code = run_model(command_env["NPU_CI_WORK"], command, model_env)
+                    command_result = {
+                        "command": command,
+                        "returncode": code,
+                        "output": "",
+                    }
+                    if code:
+                        raise RuntimeError(f"NPU suite failed with exit code {code}")
+                elif pgm is not None:
                     command_result = pgm.run(
                         command,
                         cwd=repo_root,
@@ -2095,7 +2136,7 @@ def execute_task(
         if enable_perf_diagnostics:
             run_perf_diagnostics("before cleanup", runner_env, repo_root, dry_run)
         _stop_managed_server()
-        if setup_mode == "ci" and not keep_runner_state:
+        if setup_mode == "ci" and not keep_runner_state and not is_npu_runner(runner):
             cleanup_runner(runner_env, repo_root, dry_run, pgm)
         if enable_perf_diagnostics:
             run_perf_diagnostics("after cleanup", runner_env, repo_root, dry_run)

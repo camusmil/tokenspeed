@@ -337,6 +337,6 @@ def test_performance(config, npu_suite):
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "test/ci_system/npu"))
-    from pipeline import test_entry
+    from lifecycle import test_entry
 
     raise SystemExit(test_entry(Path(__file__)))

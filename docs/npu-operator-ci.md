@@ -4,13 +4,14 @@
 
 `pr-test-ascendnpu-arm.yml` handles main pushes, main pull requests and manual
 runs. One complete GitHub API change list selects operator and model tasks
-separately. Each selected stage calls `run-ci-task-matrix-npu.yml` with a matrix,
+separately. Each selected stage calls `run-ci-task-matrix.yml` with a matrix,
 an exact `checkout_ref` SHA and `timeout_minutes`. Incomplete or stale API results
 fail selection. Draft PRs and disabled hardware skip runner allocation.
 
-The reusable workflow has `max-parallel: 1` and `fail-fast: true`. The operator
+The shared workflow preserves its GPU matrix behavior. Explicit caller dependencies
+order the two NPU jobs; the cross-runner host lock serializes hardware access. The operator
 suite runs all accuracy tests before all performance tests. The independent
-`qwen-npu-smoke` job prepares its runtime and generates one bounded response.
+`ut-runtime-qwen-smoke-1npu` job prepares its runtime and generates one bounded response.
 When both tasks are selected, operators run first; failure or cancellation blocks
 the model. A model-only change allows the operator job to be skipped.
 Any required test, configuration, log or report failure stops subsequent tests.
@@ -23,7 +24,7 @@ Repository variables:
 - `TOKENSPEED_NPU_ARM_CI_ENABLED`: must be `true`; hardware is disabled by default.
 - `TOKENSPEED_NPU_ARM_RUNNER_NAME`: required exact self-hosted runner name.
 - `TOKENSPEED_NPU_ARM_MODEL_CI_ENABLED`: must be `true` for automatic model jobs.
-  It stays unset until model acceptance. A manual dispatch can explicitly set
+  A manual dispatch can explicitly set
   `run_model_validation: true` to validate the model before enabling automatic CI.
 
 Both task types use `ascend-npu-ops-test`. Runner identity variables are read by
@@ -32,18 +33,25 @@ cancel its caller by sharing that group.
 
 ## Task declaration and tests
 
-The two JSON task declarations own registration, watched paths, resources,
-timeouts and report/cleanup policy. `ut-tokenspeed-kernel-npu.json` selects the
-operator suite; `qwen-npu-smoke.json` selects the model suite.
-Concrete cases, reference calculations and sample counts live only in the two
-pytest modules under `tokenspeed-kernel/test/npu/ops/`. Add an operator module and
-register its path; do not add operator-name branches to the executor.
+The public YAML declarations `test/ci/ut/npu-operators.yaml` and
+`test/ci/ut/ut-runtime-qwen-smoke-1npu.yaml` use the same task API, `ut` type,
+`unit-test` stage, scanner and executor as GPU tasks. Their `npu` settings own
+watched paths, resource limits, immutable model identity and archive/cleanup policy.
+The NPU runner group is explicitly excluded from GPU task matrices and YAML
+runner-label classification. Existing GPU commands and cleanup paths are retained.
 
-The NPU declaration intentionally remains JSON. The shared YAML discovery and
-runner classification currently accept unknown non-AMD labels as NVIDIA x86.
-Changing a file suffix or adding an NPU label would not isolate the task. Neither
-the NVIDIA/AMD workflows nor their shared controller or conftest is modified.
-Changes under existing GPU watched paths can still select GPU CI.
+The public pipeline executes the operator YAML once per phase, using `NPU_PHASE`
+set by the two accuracy/performance steps. Concrete cases, reference calculations
+and sample counts remain in `tokenspeed-kernel/test/npu/ops/`. Add an operator to
+the declaration instead of adding operator-name branches to the executor.
+
+The model YAML installs its independent runtime, then calls
+`test/runtime/run_ci_suite.py --device npu --suite runtime-1npu`. Tests register
+with the public AST registry through `register_npu_ci`; CUDA registration remains
+separate. A selected NPU suite with no enabled tests fails. The Qwen module is a
+normal pytest test. The lifecycle helper wraps suite execution with native NPU
+environment, host admission, deadlines, process supervision and required result
+validation; it does not select individual model files.
 
 The registered tests expose parametrized `test_accuracy` and `test_performance`
 functions. Collection does not import `torch_npu`; a generic pytest run skips
@@ -64,7 +72,7 @@ then all registered performance. Standalone module commands require the prepared
 NPU environment and source paths; resource admission belongs to the task entry.
 
 ```bash
-python -B test/ci_system/npu/pipeline.py run --work "$NPU_CI_WORK" --mode all
+python -B test/ci_system/npu/lifecycle.py run --work "$NPU_CI_WORK" --mode all
 ```
 
 Before any calculation, the executor collects both pytest plans and freezes the
@@ -78,7 +86,7 @@ when every timing sample is complete and valid.
 
 ## Offline Qwen smoke
 
-`test/runtime/models/qwen_npu_smoke.py` runs the native NPU engine with one visible
+`test/runtime/models/test_qwen3_npu_smoke.py` runs the native NPU engine with one visible
 device, BF16, greedy sampling, seed 0 and TP/DP/PP equal to 1. The task fixes the
 prompt and a maximum of 16 generated tokens. It validates token IDs, finish reason,
 completion count, finite JSON evidence and nonempty decoded text. This is an
@@ -123,7 +131,7 @@ job. The model has a separate 900-second installation deadline and 600-second
 inference deadline. Lock waiting does not consume the inference deadline.
 
 Before sources exist, the workflow uses a root-owned installation of the same
-`pipeline.py` under `/srv/npu-ci/runtime/vm-phase1-qwen-v1`. Its `policy.json` contains
+`lifecycle.py` under `/srv/npu-ci/runtime/shared-qwen-v1`. Its `policy.json` contains
 deployment paths, repository identity, minimum free space, `task_paths`, the
 readonly model mapping and model build paths. `task_paths` maps each supported
 config to its root-owned declaration copy; the legacy `task_path` may still
@@ -137,7 +145,7 @@ identities, so two tasks in one Actions run cannot overwrite each other.
 Git fetch makes at most four attempts, separated by 30 seconds, retaining each
 Git error and exit code. Cancellation is not retried. Each download attempt is
 bounded, and a final failure retains bootstrap/fetch diagnostics for archiving.
-It checks the exact checkout SHA and byte equality of the installed pipeline and
+It checks the exact checkout SHA and byte equality of the installed lifecycle helper and
 task declaration with the selected source. A source change to either requires
 an explicit reviewed runtime update before hardware execution. The Qwen version
 uses its own runtime and work/evidence/state slot; older validated slots remain
@@ -152,7 +160,7 @@ restarts the Runner, changes CANN/drivers, or rewrites older deployment slots.
 ## Evidence and cleanup
 
 The reusable workflow performs official `actions/upload-artifact` uploads. Policy
-comes from the task: 7 days retention, 1 GiB maximum bundle size and three upload
+comes from the YAML `npu.archive` settings: 7 days retention, 1 GiB maximum bundle size and three upload
 attempts. The three upload steps temporarily tolerate an attempt failure only
 for retry; final acknowledgement returns failure if every upload failed.
 

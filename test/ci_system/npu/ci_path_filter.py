@@ -29,7 +29,7 @@ import subprocess
 from fnmatch import fnmatchcase
 from pathlib import Path
 
-from pipeline import CONFIG_PATH, MODEL_CONFIG_PATH, config_path, load_task
+from lifecycle import CONFIG_PATH, MODEL_CONFIG_PATH, config_path, load_task
 
 
 def select_suite(task: dict, event_name: str, paths: set[str]) -> dict:
@@ -166,15 +166,39 @@ def main() -> int:
         stages = {}
         for task in tasks:
             selection = select_suite(task, args.event_name, paths)
-            selection["matrix"] = {
-                "include": (
-                    [
-                        {key: task[key] for key in ("name", "type", "runner")}
-                        | {"config": config_path(task)}
-                    ]
-                    if selection["should_run"]
-                    else []
+            # The public scanner is the single source of task matrix metadata.
+            import sys
+
+            command = [
+                sys.executable,
+                "-B",
+                str(args.repo_root / "test/ci_system/pipeline.py"),
+                "scan",
+                "--repo-root",
+                str(args.repo_root),
+                "--runner-group",
+                "npu",
+                "--workflow-stage",
+                "unit-test",
+                "--trigger",
+                {
+                    "pull_request": "per-commit",
+                    "push": "post-submit",
+                    "workflow_dispatch": "manual",
+                }[args.event_name],
+            ]
+            matrix = json.loads(subprocess.check_output(command, text=True, timeout=60))
+            entries = [
+                entry
+                for entry in matrix["include"]
+                if entry["config"] == config_path(task)
+            ]
+            if len(entries) != 1:
+                raise ValueError(
+                    "Public scanner did not produce exactly one selected NPU task"
                 )
+            selection["matrix"] = {
+                "include": entries if selection["should_run"] else []
             }
             selection["timeout_minutes"] = task["timeouts"]["job_minutes"]
             stages[task["workflow_stage"]] = selection

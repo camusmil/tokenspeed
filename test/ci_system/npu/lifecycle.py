@@ -868,11 +868,11 @@ def save_report(report, output_dir, github_summary=None):
 
 # Task declaration
 
-CONFIG_PATH = "test/ci/npu_test/ut-tokenspeed-kernel-npu.json"
-MODEL_CONFIG_PATH = "test/ci/npu_test/qwen-npu-smoke.json"
+CONFIG_PATH = "test/ci/ut/npu-operators.yaml"
+MODEL_CONFIG_PATH = "test/ci/ut/ut-runtime-qwen-smoke-1npu.yaml"
 TASKS = {
     CONFIG_PATH: ("ut-tokenspeed-kernel-npu", "ut", "operator"),
-    MODEL_CONFIG_PATH: ("qwen-npu-smoke", "model_smoke", "model"),
+    MODEL_CONFIG_PATH: ("ut-runtime-qwen-smoke-1npu", "model_smoke", "model"),
 }
 
 
@@ -906,7 +906,37 @@ def run_key(state):
 
 def load_task(path):
 
-    task = decode_record(Path(path).read_text(encoding="utf-8"))
+    import yaml
+
+    document = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    require(document.get("api_version") == "ci.tokenspeed.io/v1", "Invalid task API")
+    require(
+        document.get("type") == "ut" and document.get("workflow_stage") == "unit-test",
+        "Expected a unit-test task",
+    )
+    require(
+        document.get("triggers") == ["per-commit", "manual"], "Invalid public triggers"
+    )
+    settings = document["npu"]
+    kind = settings["kind"]
+    require(kind in ("operator", "model"), "Unsupported NPU task kind")
+    require(
+        document["runner"]["labels"] == ["ascend-npu-ops-test"], "Invalid NPU runner"
+    )
+    task = dict(
+        settings,
+        schema_version=1,
+        name=document["name"],
+        type="model_smoke" if kind == "model" else "ut",
+        workflow_stage=kind,
+        triggers=["push", "pull_request", "workflow_dispatch"],
+        runner=document["runner"]["labels"][0],
+        report=settings["archive"],
+    )
+    require(
+        document.get("report") == {"github_step_summary": True},
+        "Required public summary disabled",
+    )
     require(
         type(task.get("schema_version")) is int and task["schema_version"] == 1,
         "Expected task schema_version=1",
@@ -975,7 +1005,7 @@ def load_task(path):
     )
     if model:
         require(
-            task.get("script") == "test/runtime/models/qwen_npu_smoke.py",
+            task.get("script") == "test/runtime/models/test_qwen3_npu_smoke.py",
             "Unsupported model entry",
         )
         value = task.get("model")
@@ -1245,7 +1275,13 @@ RUN_NAME = re.compile(
 )
 
 
-PHASE_FILES = {"context.json", "report.json", "summary.md", "executor-error.log"}
+PHASE_FILES = {
+    "context.json",
+    "report.json",
+    "summary.md",
+    "executor-error.log",
+    "pipeline-result.json",
+}
 
 
 OPERATOR_FILES = {"process.json", "result.json"}
@@ -1539,6 +1575,10 @@ def collect(policy, work, now, outcomes):
             directory = work / phase
             if state["phases"].get(phase, {}).get("exit") == 0:
                 mandatory = ["context.json", "report.json", "summary.md"]
+                if "task_config" in state:
+                    mandatory.append("pipeline-result.json")
+                if "task_config" in state:
+                    mandatory.append("pipeline-result.json")
                 if phase == "runtime":
                     mandatory.append("install-evidence.json")
                 elif phase == "model":
@@ -1567,6 +1607,8 @@ def collect(policy, work, now, outcomes):
                         "model-manifest.json",
                         "result.json",
                         "constraints.txt",
+                        "pipeline-result.json",
+                        "suite-context.json",
                         "pip-check.log",
                         "runtime-install.log",
                         "build-tools.log",
@@ -1602,6 +1644,8 @@ def collect(policy, work, now, outcomes):
                             "install-evidence.json",
                             "pip-report.json",
                             "constraints.txt",
+                            "pipeline-result.json",
+                            "suite-context.json",
                             "model-manifest.json",
                             "admission.json",
                             "result.json",
@@ -1609,7 +1653,11 @@ def collect(policy, work, now, outcomes):
                     ):
                         selected.append(path)
                     continue
-                if succeeded and path.name not in ("context.json", "summary.md"):
+                if succeeded and path.name not in (
+                    "context.json",
+                    "summary.md",
+                    "pipeline-result.json",
+                ):
                     continue
                 relative = path.relative_to(directory)
                 if len(relative.parts) == 1 and path.name in PHASE_FILES:
@@ -3059,7 +3107,7 @@ def prepare_model_runtime(work, policy_path):
                 [
                     str(python),
                     "-B",
-                    str(root / "test/ci_system/npu/pipeline.py"),
+                    str(root / "test/ci_system/npu/lifecycle.py"),
                     "model-install-proof",
                     "--work",
                     str(work),
@@ -3103,6 +3151,7 @@ def prepare_model_runtime(work, policy_path):
 
 
 def record_model_install(work):
+    os.environ.update(env)
     work, root, source, task = model_context(work, clean=False)
     prefix = (work / "model-venv").resolve(strict=True)
     require(
@@ -3165,7 +3214,7 @@ def record_model_install(work):
     return 0
 
 
-def run_model(work):
+def run_model(work, command, env):
     import fcntl
     import socket
 
@@ -3177,6 +3226,7 @@ def run_model(work):
     )
     python = model_environment(work)
     os.environ["TOKENSPEED_CI_SOURCE_SHA"] = source["sha"]
+    os.environ["PYTHONPATH"] = str(root / "test")
     directory = work / "model"
     directory.mkdir()
     model = task["model"]
@@ -3217,51 +3267,18 @@ def run_model(work):
             {"lock_wait_seconds": time.monotonic() - started, "port": port},
         )
         print("Host lock acquired; starting model smoke", flush=True)
-        command = [
-            str(python),
-            "-B",
-            str(root / task["script"]),
-            "--source-root",
-            str(root),
-            "--source-sha",
-            source["sha"],
-            "--install-evidence",
-            str(work / "runtime/install-evidence.json"),
-            "--model",
-            deployment["path"],
-            "--model-id",
-            model["id"],
-            "--model-revision",
-            model["revision"],
-            "--manifest-sha256",
-            model["manifest_sha256"],
-            "--dtype",
-            model["dtype"],
-            "--sampling-backend",
-            model["sampling_backend"],
-            "--temperature",
-            str(model["temperature"]),
-            "--device",
-            model["device"],
-            "--device-count",
-            str(model["device_count"]),
-            "--tp-size",
-            str(model["tp_size"]),
-            "--dp-size",
-            str(model["dp_size"]),
-            "--pp-size",
-            str(model["pp_size"]),
-            "--prompt",
-            model["prompt"],
-            "--max-new-tokens",
-            str(model["max_new_tokens"]),
-            "--seed",
-            str(model["seed"]),
-            "--port",
-            str(port),
-            "--output-dir",
-            str(directory / "inference"),
-        ]
+        context = {
+            "source_root": str(root),
+            "source_sha": source["sha"],
+            "install_evidence": str(work / "runtime/install-evidence.json"),
+            "deployment": deployment,
+            "model": model,
+            "port": port,
+            "output_dir": str(directory / "inference"),
+        }
+        write_json(directory / "suite-context.json", context)
+        os.environ["NPU_MODEL_CONTEXT"] = str(directory / "suite-context.json")
+        command = ["bash", "-e", "-o", "pipefail", "-c", command]
         captured = capture_test(
             command,
             root,
@@ -3425,7 +3442,7 @@ def prepare_task(argv):
     identity.update(task_name=trusted_task["name"], task_config=args.config)
     work = initialize(policy, identity, worker_identity(), time.time())
     with Path(os.environ["GITHUB_ENV"]).open("a") as output:
-        output.write(f"NPU_CI_WORK={work}\n")
+        output.write(f"NPU_CI_WORK={work}\nPYTHONDONTWRITEBYTECODE=1\n")
     checkout = work / "checkout"
     try:
         require(args.config in TASKS, "Unsupported task config")
@@ -3467,7 +3484,7 @@ def prepare_task(argv):
         require(actual == identity["sha"], "Checkout SHA mismatch")
         require(
             Path(__file__).read_bytes()
-            == (checkout / "test/ci_system/npu/pipeline.py").read_bytes(),
+            == (checkout / "test/ci_system/npu/lifecycle.py").read_bytes(),
             "Host pipeline runtime does not match selected source",
         )
         require(
@@ -3516,7 +3533,13 @@ def main(argv=None):
             return prepare_model_runtime(args.work, args.policy)
         if argv[0] == "model-install-proof":
             return record_model_install(args.work)
-        return run_model(args.work)
+        import yaml
+
+        document = yaml.safe_load(
+            (Path(args.work) / "checkout" / MODEL_CONFIG_PATH).read_text()
+        )
+        command = document["ut"]["commands"][0]
+        return run_model(args.work, command, dict(os.environ))
     if argv and argv[0] == "lifecycle":
         return lifecycle_cli(argv[1:])
     return phase_main(argv)
