@@ -3151,7 +3151,6 @@ def prepare_model_runtime(work, policy_path):
 
 
 def record_model_install(work):
-    os.environ.update(env)
     work, root, source, task = model_context(work, clean=False)
     prefix = (work / "model-venv").resolve(strict=True)
     require(
@@ -3218,13 +3217,14 @@ def run_model(work, command, env):
     import fcntl
     import socket
 
+    os.environ.update(env)
     work, root, source, task = model_context(work, clean=False)
     require(
         read_json(work / "lifecycle.json")["phases"].get("runtime", {}).get("exit")
         == 0,
         "Model runtime step did not succeed; generation is blocked",
     )
-    python = model_environment(work)
+    model_environment(work)
     os.environ["TOKENSPEED_CI_SOURCE_SHA"] = source["sha"]
     os.environ["PYTHONPATH"] = str(root / "test")
     directory = work / "model"
