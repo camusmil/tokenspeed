@@ -2,7 +2,7 @@
 
 ## Triggers and change selection
 
-The workflow is `.github/workflows/pr-test-ascendnpu-arm.yml`, displayed as `PR Test Ascend NPU ARM`.
+The workflow is `.github/workflows/pr-test-ascendnpu-arm.yml`, displayed as `Ascend NPU Tests`.
 It runs in `lightseekorg/tokenspeed` or the repository identified by the full `owner/repository` value of the `TOKENSPEED_NPU_CI_REPOSITORY` repository variable. Forks must explicitly set that variable.
 Triggers include pushes to main, `pull_request` events targeting main, and `workflow_dispatch`.
 The `select` job can run in an allowed repository. The hardware job additionally requires `TOKENSPEED_NPU_ARM_CI_ENABLED` to be set to `true`.
@@ -29,6 +29,7 @@ Any matching path selects every registered operator. Unrelated changes emit `sho
 The workflow has no top-level path filter, so unrelated changes still produce a selection result.
 The caller passes the selected `test/ci/ut/npu-operators.yaml` task to `.github/workflows/run-ci-task-matrix.yml`, using the dedicated NPU runner label. This shared workflow invokes `test/ci_system/pipeline.py` in the existing NPU environment; the task has no dependency-install stage or Docker requirement.
 NPU CI implementation and operator tests remain under `ci/npu_ops_test/`; new operators do not require changes to GPU task lists.
+The dedicated `npu` matrix group selects only `tokenspeed-npu-arm64`; AMD MI350, AMD MI450, and NVIDIA groups exclude that runner. GPU path selection also ignores NPU-only task YAML changes.
 
 ## Components and execution order
 
