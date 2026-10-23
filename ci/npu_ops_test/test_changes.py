@@ -21,11 +21,21 @@
 """CPU-only selection tests with fixtures for the external GitHub API."""
 
 import copy
+import os
 import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from ci.npu_ops_test.changes import changed_paths, load_manifest, select_suite
+from ci.npu_ops_test import changes
+from ci.npu_ops_test.changes import (
+    changed_paths,
+    load_manifest,
+    select_model_suite,
+    select_suite,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 REPOSITORY = "example/tokenspeed"
@@ -78,6 +88,63 @@ class ChangeSelectionTest(unittest.TestCase):
     def select_pr(self, event, api):
         paths = changed_paths(REPOSITORY, "pull_request", event, api=api)
         return select_suite(self.manifest, "pull_request", paths)
+
+    def test_model_only_changes_do_not_select_operators(self):
+        for path in (
+            "test/runtime/models/test_qwen3_npu_smoke.py",
+            "test/ci/ut/ut-runtime-1npu.yaml",
+            "python/tokenspeed/runtime/entrypoints/engine.py",
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(
+                    select_suite(self.manifest, "pull_request", {path})["should_run"]
+                )
+                self.assertTrue(
+                    select_model_suite("pull_request", {path})["should_run"]
+                )
+
+    def test_shared_runtime_implementation_and_tests_select_model_suite(self):
+        for name in (
+            "process_group_manager.py",
+            "install_deps.sh",
+            "test_pipeline.py",
+            "test_process_group_manager.py",
+            "test_dispatch_workflows.py",
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(
+                    select_model_suite("pull_request", {f"test/ci_system/{name}"})[
+                        "should_run"
+                    ]
+                )
+
+    def test_operator_only_and_shared_changes(self):
+        path = "ci/npu_ops_test/tests/scatter-test.py"
+        self.assertTrue(
+            select_suite(self.manifest, "pull_request", {path})["should_run"]
+        )
+        self.assertFalse(select_model_suite("pull_request", {path})["should_run"])
+        path = "ci/npu_ops_test/changes.py"
+        self.assertTrue(
+            select_suite(self.manifest, "pull_request", {path})["should_run"]
+        )
+        self.assertTrue(select_model_suite("pull_request", {path})["should_run"])
+        path = "tokenspeed-kernel-npu/topic.py"
+        self.assertTrue(
+            select_suite(self.manifest, "pull_request", {path})["should_run"]
+        )
+        self.assertTrue(select_model_suite("pull_request", {path})["should_run"])
+        self.assertFalse(
+            select_model_suite("pull_request", {"docs/topic.md"})["should_run"]
+        )
+        self.assertTrue(select_model_suite("workflow_dispatch", set())["should_run"])
+
+    def test_shared_source_reporter_selects_both_tasks(self):
+        paths = {".github/scripts/ci_result_source.py"}
+        self.assertTrue(
+            select_suite(self.manifest, "pull_request", paths)["should_run"]
+        )
+        self.assertTrue(select_model_suite("pull_request", paths)["should_run"])
 
     def test_pr_selection_from_complete_api_files(self):
         for path, watched in (
@@ -246,6 +313,73 @@ class ChangeSelectionTest(unittest.TestCase):
                     )
         with self.assertRaisesRegex(ValueError, "Unsupported event"):
             changed_paths(REPOSITORY, "release", {}, api=GitHubFixture([]))
+
+
+class GitHubRetryTests(unittest.TestCase):
+    def check_api_retry(self, failures, status):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            calls = root / "api-calls"
+            gh = root / "gh"
+            gh.write_text(f"#!{sys.executable}\n" + f"""
+import pathlib, sys
+path = pathlib.Path({str(calls)!r})
+count = int(path.read_text()) + 1 if path.exists() else 1
+path.write_text(str(count))
+if count <= {failures}:
+    print('original API transport failure', file=sys.stderr)
+    sys.exit({status})
+print('{{"ok": true}}')
+""")
+            gh.chmod(0o755)
+            waits = []
+            with mock.patch.dict(
+                os.environ, {"PATH": f"{root}:{os.environ['PATH']}"}
+            ), mock.patch.object(changes.time, "sleep", waits.append):
+                if failures == 4 or status in (130, 143):
+                    with self.assertRaises(subprocess.CalledProcessError) as error:
+                        changes.github_json(
+                            "/repos/fixture/tokenspeed/pulls/12", paginate=False
+                        )
+                    self.assertEqual(error.exception.returncode, status)
+                    self.assertIn(
+                        "original API transport failure", error.exception.stderr
+                    )
+                else:
+                    self.assertEqual(
+                        changes.github_json(
+                            "/repos/fixture/tokenspeed/pulls/12", paginate=False
+                        ),
+                        {"ok": True},
+                    )
+            self.assertEqual(int(calls.read_text()), 1 if status in (130, 143) else 4)
+            self.assertEqual(waits, [] if status in (130, 143) else [30, 30, 30])
+
+    def test_api_fourth_attempt_succeeds(self):
+        self.check_api_retry(3, 1)
+
+    def test_api_exhaustion_preserves_error(self):
+        self.check_api_retry(4, 1)
+
+    def test_api_sigint_does_not_retry(self):
+        self.check_api_retry(1, 130)
+
+    def test_api_sigterm_does_not_retry(self):
+        self.check_api_retry(1, 143)
+
+    def test_request_timeout_is_retried_and_remains_failure(self):
+        waits = []
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            changes.time, "sleep", waits.append
+        ):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                changes.run_github(
+                    [sys.executable, "-c", "import time; time.sleep(10)"],
+                    cwd=directory,
+                    timeout_seconds=0.05,
+                    capture_output=True,
+                )
+        self.assertEqual(waits, [30, 30, 30])
 
 
 if __name__ == "__main__":

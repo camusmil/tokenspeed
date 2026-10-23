@@ -22,7 +22,7 @@ from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
-from process_group_manager import ProcessGroupManager, make_manager
+from process_group_manager import CommandSupervision, ProcessGroupManager, make_manager
 
 try:
     import yaml
@@ -472,6 +472,11 @@ def build_matrix(
                 "priority": effective,
                 "optional": is_optional,
             }
+            if is_npu_runner(runner):
+                entry["npu_runtime"] = (
+                    str(task.get("env", {}).get("NPU_CI_RUNTIME", "false")).lower()
+                    == "true"
+                )
             if task_workflow_stage is not None:
                 entry["workflow_stage"] = task_workflow_stage
             include.append(entry)
@@ -763,6 +768,112 @@ def ensure_ready_port_available(ready: Dict[str, Any], dry_run: bool) -> None:
     )
 
 
+def npu_runtime_environment(env, root, *, dry_run):
+    import platform
+    import pwd
+
+    if dry_run:
+        return dict(env)
+    if platform.system() != "Linux" or platform.machine() not in ("aarch64", "arm64"):
+        raise RuntimeError("NPU runtime CI requires Linux ARM64")
+    if pwd.getpwuid(os.geteuid()).pw_name != "ci-npu":
+        raise RuntimeError("NPU runtime CI requires the ci-npu account")
+    root = root.resolve(strict=True)
+    work = Path(env["NPU_CI_WORK"]).resolve(strict=True)
+    if root != work / "checkout":
+        raise ValueError("Runtime source must be this task's checkout")
+    sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True
+    ).strip()
+    if sha != env["GITHUB_SHA"]:
+        raise ValueError("Runtime source differs from the event commit")
+    subprocess.run(["git", "diff", "--exit-code", "HEAD", "--"], cwd=root, check=True)
+    config = Path(env["NPU_CI_DEPLOYMENT"])
+    if (
+        config.is_symlink()
+        or config.stat().st_uid != 0
+        or config.stat().st_mode & 0o022
+    ):
+        raise ValueError("NPU deployment must be a root-owned protected regular file")
+    deployment = json.loads(config.read_text())
+    for key in ("environment", "python", "wheels", "openssl_root", "model"):
+        value = Path(deployment[key])
+        if not value.is_absolute() or not value.exists():
+            raise ValueError(f"Missing NPU deployment path: {key}")
+    raw = subprocess.check_output(
+        [
+            "bash",
+            "-c",
+            'set -e; source "$1" >/dev/null; source "$ASCEND_HOME_PATH/share/info/ascendnpu-ir/bin/set_env.sh" >/dev/null; env -0',
+            "npu-runtime-env",
+            deployment["environment"],
+        ],
+        env=env,
+    )
+    result = dict(env)
+    for item in raw.split(b"\0"):
+        if b"=" in item:
+            key, value = os.fsdecode(item).split("=", 1)
+            result[key] = value
+    for name in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "TORCH_TRANSFER_TO_NPU",
+        "PIP_INDEX_URL",
+        "PIP_EXTRA_INDEX_URL",
+        "PIP_CONSTRAINT",
+        "PIP_NO_INDEX",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "HF_TOKEN",
+    ):
+        result.pop(name, None)
+    venv = work / "model-venv"
+    result.update(
+        NPU_CI_SOURCE_ROOT=str(root),
+        TOKENSPEED_CI_SOURCE_SHA=sha,
+        NPU_CI_BOOTSTRAP_PYTHON=deployment["python"],
+        NPU_CI_WHEELS=deployment["wheels"],
+        NPU_SMOKE_MODEL_PATH=deployment["model"],
+        VIRTUAL_ENV=str(venv),
+        PATH=f"{venv / 'bin'}{os.pathsep}{result['PATH']}",
+        PIP_CONFIG_FILE="/dev/null",
+        PIP_REQUIRE_VIRTUALENV="1",
+        PYTHONNOUSERSITE="1",
+        PYTHONDONTWRITEBYTECODE="1",
+        PYTHONUNBUFFERED="1",
+        ASCEND_RT_VISIBLE_DEVICES="0",
+        TOKENSPEED_KERNEL_BACKEND="npu",
+        TOKENSPEED_KERNEL_GIT_SHA=sha,
+        TOKENSPEED_KERNEL_GIT_BRANCH="ci/npu",
+        TOKENSPEED_KERNEL_NIGHTLY="false",
+        CMAKE_ARGS=f"-DOPENSSL_ROOT_DIR={deployment['openssl_root']}",
+        CMAKE_BUILD_PARALLEL_LEVEL="4",
+    )
+    for name, relative in {
+        "TMPDIR": "tmp",
+        "XDG_CACHE_HOME": "cache",
+        "TRITON_CACHE_DIR": "cache/triton",
+        "TVM_FFI_CACHE_DIR": "cache/tvm",
+        "TORCH_EXTENSIONS_DIR": "cache/torch",
+        "TORCH_HOME": "cache/torch-home",
+        "HF_HOME": "cache/huggingface",
+        "MODELSCOPE_CACHE": "cache/modelscope",
+    }.items():
+        path = work / relative
+        path.mkdir(parents=True, exist_ok=True)
+        result[name] = str(path)
+    (work / "runtime").mkdir(exist_ok=True)
+    parent = os.getpid()
+    while parent > 1:
+        stat = Path(f"/proc/{parent}/stat").read_text().rsplit(") ", 1)[1].split()
+        if Path(f"/proc/{parent}/comm").read_text().strip() == "Runner.Worker":
+            result.update(NPU_CI_WORKER_PID=str(parent), NPU_CI_WORKER_START=stat[19])
+            break
+        parent = int(stat[1])
+    return result
+
+
 def setup_runner(
     runner: str,
     env: Dict[str, str],
@@ -787,14 +898,33 @@ def setup_runner(
             runner_id += f"-step-{step_id}"
         if proc_id:
             runner_id += f"-proc-{proc_id}"
-        pgm = ProcessGroupManager(runner_id=runner_id)
+        pgm = ProcessGroupManager(runner_id=runner_id, supervision=None)
         local_env["CI_RUNNER_ID"] = pgm.runner_id
         print(f"[slurm] runner_id={pgm.runner_id}", flush=True)
         return local_env, pgm
     if setup_mode != "ci":
         raise ValueError(f"unsupported setup mode: {setup_mode!r}")
     if is_npu_runner(runner):
-        # The existing NPU entry owns its deployed environment and host lock.
+        if local_env.get("NPU_CI_RUNTIME") == "true":
+            local_env = npu_runtime_environment(local_env, cwd, dry_run=dry_run)
+            if not dry_run:
+                pgm = ProcessGroupManager(
+                    runner_id=local_env["NPU_CI_WORK"],
+                    supervision=CommandSupervision(
+                        log_directory=Path(local_env["NPU_CI_WORK"]) / "runtime",
+                        stage_key="NPU_CI_STAGE",
+                        timeouts={
+                            "install": int(local_env["NPU_CI_INSTALL_TIMEOUT"]),
+                            "ut": int(local_env["NPU_CI_TEST_TIMEOUT"]),
+                        },
+                        lock_path=Path(local_env["NPU_CI_LOCK"]),
+                        lock_wait=int(local_env["NPU_CI_LOCK_TIMEOUT"]),
+                        source_sha=local_env["TOKENSPEED_CI_SOURCE_SHA"],
+                        owner_pid=local_env.get("NPU_CI_WORKER_PID"),
+                        owner_start=local_env.get("NPU_CI_WORKER_START"),
+                    ),
+                )
+        # Operator phases retain their existing environment and host lock.
         return local_env, pgm
 
     if is_gb200_runner(runner):
@@ -988,9 +1118,9 @@ def _find_registered_runtime_tests(repo_root: Path, suite: str) -> List[str]:
             if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
                 continue
             call = stmt.value
-            if (
-                not isinstance(call.func, ast.Name)
-                or call.func.id != "register_cuda_ci"
+            if not isinstance(call.func, ast.Name) or call.func.id not in (
+                "register_cuda_ci",
+                "register_npu_ci",
             ):
                 continue
             for keyword in call.keywords:
@@ -2062,6 +2192,8 @@ def execute_task(
                         "before perf command", runner_env, repo_root, dry_run
                     )
                 command_env = get_stage_command_env(stage_name, runner_env)
+                if command_env.get("NPU_CI_RUNTIME") == "true":
+                    command_env = dict(command_env, NPU_CI_STAGE=stage_name)
                 if pgm is not None:
                     command_result = pgm.run(
                         command,
