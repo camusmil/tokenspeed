@@ -1704,3 +1704,52 @@ def test_npu_dependency_install_uses_wheels_without_index(
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+@pytest.mark.parametrize(
+    "allowed_names,runner_name,accepted",
+    [
+        ("npu-one", "npu-one", True),
+        ("npu-one\nnpu-two", "npu-two", True),
+        ("\nnpu-one\r\n\nnpu-two\r\n", "npu-one", True),
+        ("", "npu-one", False),
+        ("npu-one\nnpu-two", "npu-other", False),
+        ("npu-one-more", "npu-one", False),
+        ("npu-*", "npu-one", False),
+        ("npu-one", "", False),
+    ],
+)
+def test_npu_runner_allowlist_checks_exact_names(allowed_names, runner_name, accepted):
+    script = npu_step_script(
+        "run-ci-task-matrix.yml", "test", "Check NPU runner environment"
+    )
+    # Stop at the next real guard, before Linux/ARM checks or filesystem changes.
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env={
+            **os.environ,
+            "NPU_RUNNER_NAMES": allowed_names,
+            "RUNNER_NAME": runner_name,
+            "GITHUB_SERVER_URL": "https://unsupported.invalid",
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 1
+    if accepted:
+        assert "Unsupported GitHub server" in result.stderr
+        assert "NPU runner name does not match" not in result.stderr
+    else:
+        assert "NPU runner name does not match the deployment" in result.stderr
+        assert "Unsupported GitHub server" not in result.stderr
+
+
+def test_npu_pool_schedules_each_suite_once():
+    matrix = build_matrix(
+        REPO_ROOT / "test/ci", REPO_ROOT, "per-commit", "npu", "unit-test"
+    )
+    assert Counter(entry["name"] for entry in matrix["include"]) == {
+        "npu-operators": 1,
+        "ut-runtime-1npu": 1,
+    }
+    assert {entry["runner"] for entry in matrix["include"]} == {"tokenspeed-npu-arm64"}

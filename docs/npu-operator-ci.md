@@ -96,18 +96,32 @@ Source recording, artifact upload, and work-directory cleanup use the shared wor
 
 ## Runner deployment contract and evidence locations
 
-`runs-on` uses only the dedicated `tokenspeed-npu-arm64` label, without adding the default `self-hosted` label.
+`runs-on` uses the common `tokenspeed-npu-arm64` scheduling label, without adding the default `self-hosted` label.
+Runners identified by either `tokenspeed-npu-arm64` or the older `ascend-npu-ops-test` label join the same pool by carrying `tokenspeed-npu-arm64`.
+Keep `ascend-npu-ops-test` if other workflows use it. Each operator or runtime task has one matrix entry and executes once, on any available eligible runner.
+Do not append the older label to `runner.labels`: the shared scanner creates a separate task for each label. A GitHub `runs-on` label array instead requires every listed label; it does not express alternatives.
 The hardware job is disabled by default. These are deployment requirements, not assertions that upstream already has a runner, NPU, or configured runtime.
 From the repository home page, open **Settings > Secrets and variables > Actions > Variables** and configure these repository variables:
 
 | Variable | Purpose |
 | --- | --- |
 | `TOKENSPEED_NPU_CI_REPOSITORY` | Forks set their full `owner/repository`; the official `lightseekorg/tokenspeed` repository is already allowlisted |
-| `TOKENSPEED_NPU_ARM_RUNNER_NAME` | Must match the registered runner name and runtime `RUNNER_NAME`; there is no default |
+| `TOKENSPEED_NPU_ARM_RUNNER_NAMES` | Allowed registered runner names, one exact name per line; all runners must satisfy the deployment contract below |
+| `TOKENSPEED_NPU_ARM_RUNNER_NAME` | Existing single-runner setting, used only when `TOKENSPEED_NPU_ARM_RUNNER_NAMES` is unset or empty |
 | `TOKENSPEED_NPU_ARM_CI_ENABLED` | Set to `true` only after deployment requirements are met; leave unset to disable the hardware job |
 
 Assign the dedicated label to an online Linux ARM64 NPU runner running under the `ci-npu` service account.
-Once enabled, a missing or mismatched runner-name variable fails the step before checkout.
+For additional machines, open **Settings > Actions > Runners > the runner > Labels**, add `tokenspeed-npu-arm64`, and retain its existing labels.
+Add every eligible runner name to `TOKENSPEED_NPU_ARM_RUNNER_NAMES`, including the current runner. Names are matched literally, not as substrings or wildcard patterns.
+For example, two prepared machines can use this variable value:
+
+```text
+tokenspeed-fork-npu-01
+tokenspeed-fork-npu-02
+```
+
+This is a configuration example, not evidence that a second runner is deployed. The plural variable takes precedence; the existing single-runner setting continues to work when it is absent.
+Once enabled, a missing or mismatched runner-name allowlist fails the step before checkout.
 If no online runner has the required label, the job waits for scheduling and cannot execute runtime checks.
 The environment entry point is `/srv/tokenspeed-npu/cann9-torch29-py312-root/env.sh`, and the interpreter is `venv/bin/python` under the same directory.
 Working CANN, torch, torch_npu, and Triton Ascend dependencies and NPU device access for that account are required. Installing the runner alone is insufficient.

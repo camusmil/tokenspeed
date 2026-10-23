@@ -67,12 +67,20 @@ jobs:
       - name: Check NPU runner environment
         if: matrix.runner == 'tokenspeed-npu-arm64'
         env:
-          NPU_RUNNER_NAME: ${{ vars.TOKENSPEED_NPU_ARM_RUNNER_NAME }}
+          NPU_RUNNER_NAMES: ${{ vars.TOKENSPEED_NPU_ARM_RUNNER_NAMES || vars.TOKENSPEED_NPU_ARM_RUNNER_NAME }}
           NPU_REPOSITORY: ${{ vars.TOKENSPEED_NPU_CI_REPOSITORY }}
           TASK_NAME: ${{ matrix.name }}
         run: |
           set -euo pipefail
-          [[ -n "$NPU_RUNNER_NAME" && "$RUNNER_NAME" = "$NPU_RUNNER_NAME" ]] || { echo 'NPU runner name does not match the deployment' >&2; exit 1; }
+          # One exact runner name per line; do not interpret names as patterns.
+          runner_allowed=false
+          while IFS= read -r allowed_runner; do
+            allowed_runner="${allowed_runner%$'\r'}"
+            if [[ -n "$allowed_runner" && "$RUNNER_NAME" = "$allowed_runner" ]]; then
+              runner_allowed=true
+            fi
+          done <<< "$NPU_RUNNER_NAMES"
+          [[ "$runner_allowed" = true ]] || { echo 'NPU runner name does not match the deployment' >&2; exit 1; }
           [[ "$GITHUB_SERVER_URL" = https://github.com ]] || { echo 'Unsupported GitHub server' >&2; exit 1; }
           [[ "$GITHUB_REPOSITORY" = lightseekorg/tokenspeed || ( -n "$NPU_REPOSITORY" && "$GITHUB_REPOSITORY" = "$NPU_REPOSITORY" ) ]] || { echo 'Repository is not allowed on the NPU runner' >&2; exit 1; }
           [[ "$(uname -s)" = Linux ]] || { echo 'Linux is required' >&2; exit 1; }
