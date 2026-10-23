@@ -226,9 +226,29 @@ cannot modify. It contains deployment paths only, not tasks or executable code:
 }
 ```
 
-The wheel directory may also contain verified ARM64 build dependencies such as
-CMake. Both build-system and runtime dependency resolution use this directory
-with the normal pip resolver. The runtime installation has a 1,800-second limit;
+The wheel directory contains the complete ARM64 wheel set for the prepared base,
+the checkout's build requirements and all transitive runtime dependencies. An
+administrator prepares it outside CI from the current dependency requirements,
+checks each wheel against its official download SHA-256 and publishes the
+directory and files as root-owned and not group/world writable. The directory
+contains only wheels and `manifest.json`, with this schema:
+
+```json
+{"schema_version": 1, "files": {"package-1.0-py3-none-any.whl": "<sha256>"}}
+```
+
+Every install verifies ownership, file types, the exact file list and every wheel
+digest before creating its virtualenv. Base, build and runtime installs use
+`--no-index --find-links` with the normal pip resolver. Missing or incompatible
+dependencies fail immediately; there is no fallback to PyPI. When checkout
+requirements change, refresh and validate a new protected wheel set before
+updating the deployment path. The task records the manifest digest and file
+hashes in `runtime/dependency-wheelhouse.json`, alongside pip's install report.
+This dependency deployment does not reuse source checkouts, built project wheels,
+compiled kernels or virtualenvs between runs. All four repository components are
+still built from the event checkout. The operator environment stays unchanged.
+
+The runtime installation has a 1,800-second limit;
 the smoke test retains its separate 600-second limit. These limits bound
 execution and do not define a performance threshold.
 

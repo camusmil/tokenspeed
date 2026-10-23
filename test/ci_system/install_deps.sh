@@ -16,7 +16,11 @@ if [[ "${CI_RUNNER_LABEL:-}" == tokenspeed-npu-arm64 ]]; then
     [[ "${NPU_CI_RUNTIME:-}" == true ]] || { echo 'NPU runtime task required' >&2; exit 1; }
     [[ $# == 0 ]] || { echo 'NPU installation accepts no arguments' >&2; exit 1; }
     "$NPU_CI_BOOTSTRAP_PYTHON" -B - <<'NPU_INSTALL'
+import hashlib
+import json
 import os
+import re
+import stat
 import subprocess
 import tomllib
 from pathlib import Path
@@ -37,18 +41,51 @@ BASE_REQUIREMENTS = [
 ]
 
 
-def install_runtime():
-    root = Path(os.environ["NPU_CI_SOURCE_ROOT"])
-    work = Path(os.environ["NPU_CI_WORK"])
-    venv = work / "model-venv"
-    python = str(venv / "bin/python")
-    subprocess.run(
-        [os.environ["NPU_CI_BOOTSTRAP_PYTHON"], "-m", "venv", str(venv)], check=True
-    )
-    constraints = work / "runtime/constraints.txt"
-    constraints.write_text("\n".join(BASE_REQUIREMENTS + ["triton==3.5.0"]) + "\n")
-    os.environ["PIP_CONSTRAINT"] = str(constraints)
-    wheels = os.environ["NPU_CI_WHEELS"]
+def verify_wheelhouse(directory, *, owner_uid):
+    def protected(path, *, directory):
+        info = path.lstat()
+        expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+        if (
+            not expected_type(info.st_mode)
+            or info.st_uid != owner_uid
+            or info.st_mode & 0o022
+        ):
+            raise ValueError(f"NPU wheelhouse requires protected owned files: {path}")
+
+    protected(directory, directory=True)
+    manifest_path = directory / "manifest.json"
+    protected(manifest_path, directory=False)
+    raw = manifest_path.read_bytes()
+    manifest = json.loads(raw)
+    files = manifest["files"]
+    if manifest["schema_version"] != 1 or not isinstance(files, dict) or not files:
+        raise ValueError("Invalid NPU wheelhouse manifest")
+    if {path.name for path in directory.iterdir()} != set(files) | {"manifest.json"}:
+        raise ValueError("NPU wheelhouse contents differ from its manifest")
+    for name, expected in files.items():
+        if (
+            Path(name).name != name
+            or not name.endswith(".whl")
+            or not isinstance(expected, str)
+            or re.fullmatch("[0-9a-f]{64}", expected) is None
+        ):
+            raise ValueError(f"Invalid NPU wheelhouse entry: {name}")
+        path = directory / name
+        protected(path, directory=False)
+        with path.open("rb") as handle:
+            actual = hashlib.file_digest(handle, "sha256").hexdigest()
+        if actual != expected:
+            raise ValueError(f"NPU wheelhouse digest mismatch: {name}")
+    return {
+        "path": str(directory),
+        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "wheel_count": len(files),
+        "files": files,
+        "pip_index_disabled": True,
+    }
+
+
+def install_from_wheelhouse(python, wheels, requirements, *, options):
     subprocess.run(
         [
             python,
@@ -57,57 +94,62 @@ def install_runtime():
             "install",
             "--no-index",
             "--find-links",
-            wheels,
-            *BASE_REQUIREMENTS,
+            str(wheels),
+            *options,
+            *requirements,
         ],
         check=True,
+    )
+
+
+def install_runtime():
+    root = Path(os.environ["NPU_CI_SOURCE_ROOT"])
+    work = Path(os.environ["NPU_CI_WORK"])
+    venv = work / "model-venv"
+    python = str(venv / "bin/python")
+    wheels = Path(os.environ["NPU_CI_WHEELS"])
+    evidence = verify_wheelhouse(wheels, owner_uid=0)
+    (work / "runtime/dependency-wheelhouse.json").write_text(
+        json.dumps(evidence, indent=2) + "\n"
+    )
+    print(
+        f"Verified NPU dependency wheelhouse: {evidence['wheel_count']} wheels; "
+        f"manifest sha256={evidence['manifest_sha256']}. "
+        "PyPI access is disabled; missing dependencies require a wheelhouse refresh.",
+        flush=True,
+    )
+    subprocess.run(
+        [os.environ["NPU_CI_BOOTSTRAP_PYTHON"], "-m", "venv", str(venv)], check=True
+    )
+    constraints = work / "runtime/constraints.txt"
+    constraints.write_text("\n".join(BASE_REQUIREMENTS + ["triton==3.5.0"]) + "\n")
+    os.environ["PIP_CONSTRAINT"] = str(constraints)
+    os.environ["PIP_NO_INDEX"] = "1"
+    os.environ["PIP_FIND_LINKS"] = str(wheels)
+    install_from_wheelhouse(
+        python, wheels, BASE_REQUIREMENTS, options=["--only-binary=:all:"]
     )
     requirements = set()
     for relative in PROJECTS.values():
         with (root / relative / "pyproject.toml").open("rb") as handle:
             requirements.update(tomllib.load(handle)["build-system"]["requires"])
-    subprocess.run(
-        [
-            python,
-            "-m",
-            "pip",
-            "install",
-            "--timeout",
-            "15",
-            "--retries",
-            "1",
-            "--index-url",
-            "https://pypi.org/simple",
-            "--find-links",
-            wheels,
-            *sorted(requirements),
-        ],
-        check=True,
+    install_from_wheelhouse(
+        python, wheels, sorted(requirements), options=["--only-binary=:all:"]
     )
-    subprocess.run(
-        [
-            python,
-            "-m",
-            "pip",
-            "install",
+    install_from_wheelhouse(
+        python,
+        wheels,
+        [str(root / p) for p in PROJECTS.values()],
+        options=[
             "--no-build-isolation",
-            "--timeout",
-            "15",
-            "--retries",
-            "1",
-            "--index-url",
-            "https://pypi.org/simple",
-            "--find-links",
-            wheels,
             "--report",
             str(work / "runtime/pip-report.json"),
-            *[str(root / p) for p in PROJECTS.values()],
         ],
-        check=True,
     )
 
 
-install_runtime()
+if __name__ == "__main__":
+    install_runtime()
 NPU_INSTALL
     exec "$NPU_CI_WORK/model-venv/bin/python" -B - <<'NPU_PROOF'
 import hashlib

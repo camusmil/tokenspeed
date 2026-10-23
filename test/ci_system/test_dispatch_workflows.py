@@ -1566,3 +1566,141 @@ def test_runtime_install_entry_preserves_interpreter_arguments_and_status(
     )
     assert result.returncode == (status or proof_status)
     assert json.loads(arguments.read_text()) == ["-B", "-"]
+
+
+def npu_installer_functions():
+    source = (REPO_ROOT / "test/ci_system/install_deps.sh").read_text()
+    script = source.split("<<'NPU_INSTALL'\n", 1)[1].split("\nNPU_INSTALL", 1)[0]
+    namespace = {"__name__": "npu_installer_test"}
+    exec(compile(script, "install_deps.sh:NPU_INSTALL", "exec"), namespace)
+    return namespace
+
+
+def write_npu_wheel_manifest(directory):
+    import hashlib
+
+    files = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in directory.glob("*.whl")
+    }
+    manifest = directory / "manifest.json"
+    manifest.write_text(json.dumps({"schema_version": 1, "files": files}))
+    manifest.chmod(0o644)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["content", "extra", "symlink", "writable-file", "writable-directory", "owner"],
+)
+def test_npu_wheelhouse_rejects_untrusted_changes(tmp_path, damage):
+    wheel = tmp_path / "fixture-1-py3-none-any.whl"
+    wheel.write_bytes(b"verified fixture")
+    wheel.chmod(0o644)
+    tmp_path.chmod(0o755)
+    write_npu_wheel_manifest(tmp_path)
+    verify = npu_installer_functions()["verify_wheelhouse"]
+    result = verify(tmp_path, owner_uid=os.getuid())
+    assert result["wheel_count"] == 1
+    if damage == "content":
+        wheel.write_bytes(b"changed")
+    elif damage == "extra":
+        (tmp_path / "extra-1-py3-none-any.whl").write_bytes(b"extra")
+    elif damage == "symlink":
+        data = wheel.read_bytes()
+        wheel.unlink()
+        target = tmp_path.parent / "outside.whl"
+        target.write_bytes(data)
+        wheel.symlink_to(target)
+    elif damage == "writable-file":
+        wheel.chmod(0o666)
+    elif damage == "writable-directory":
+        tmp_path.chmod(0o777)
+    owner = os.getuid() + 1 if damage == "owner" else os.getuid()
+    with pytest.raises(ValueError):
+        verify(tmp_path, owner_uid=owner)
+
+
+@pytest.mark.parametrize("missing_dependency", [False, True])
+def test_npu_dependency_install_uses_wheels_without_index(
+    tmp_path, monkeypatch, missing_dependency
+):
+    import threading
+    import venv
+    import zipfile
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    requests = []
+
+    class Index(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            self.send_error(503)
+
+        def log_message(self, *args):
+            pass
+
+    wheelhouse = tmp_path / "wheels"
+    wheelhouse.mkdir(mode=0o755)
+    name = "npu_ci_offline_fixture"
+    info = f"{name}-1.0.dist-info"
+    files = {
+        f"{name}.py": "VALUE = 42\n",
+        f"{info}/METADATA": (
+            "Metadata-Version: 2.1\nName: npu-ci-offline-fixture\nVersion: 1.0\n"
+            + (
+                "Requires-Dist: npu-ci-missing-dependency>=1\n"
+                if missing_dependency
+                else ""
+            )
+        ),
+        f"{info}/WHEEL": "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+    }
+    files[f"{info}/RECORD"] = (
+        "".join(f"{path},,\n" for path in files) + f"{info}/RECORD,,\n"
+    )
+    wheel = wheelhouse / f"{name}-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for path, content in files.items():
+            archive.writestr(path, content)
+    wheel.chmod(0o644)
+    write_npu_wheel_manifest(wheelhouse)
+    installer = npu_installer_functions()
+    installer["verify_wheelhouse"](wheelhouse, owner_uid=os.getuid())
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=True).create(environment)
+    python = str(environment / "bin/python")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Index)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("PIP_CONFIG_FILE", os.devnull)
+    monkeypatch.setenv("PIP_INDEX_URL", f"http://127.0.0.1:{server.server_port}/simple")
+    monkeypatch.setenv(
+        "PIP_EXTRA_INDEX_URL", f"http://127.0.0.1:{server.server_port}/extra"
+    )
+    for key in ("PIP_NO_INDEX", "PIP_FIND_LINKS", "PIP_CONSTRAINT"):
+        monkeypatch.delenv(key, raising=False)
+    try:
+
+        def install():
+            installer["install_from_wheelhouse"](
+                python,
+                wheelhouse,
+                ["npu-ci-offline-fixture==1.0"],
+                options=["--only-binary=:all:", "--disable-pip-version-check"],
+            )
+
+        if missing_dependency:
+            with pytest.raises(subprocess.CalledProcessError):
+                install()
+        else:
+            install()
+            output = subprocess.check_output(
+                [python, "-c", f"import {name}; print({name}.VALUE)"], text=True
+            )
+            assert output.strip() == "42"
+            subprocess.run([python, "-m", "pip", "check"], check=True)
+        assert requests == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
