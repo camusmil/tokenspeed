@@ -101,6 +101,6 @@ jobs:
     uses: ./.github/workflows/run-ci-task-matrix.yml
     with:
       matrix: ${{ needs.select.outputs.matrix }}
-      install_tokenspeed_mla_from_source: 'false'
+      install_tokenspeed_mla_from_source: ${{ 'false' }}
       checkout_ref: ${{ github.sha }}
       timeout_minutes: 60

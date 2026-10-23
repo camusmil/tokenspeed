@@ -29,6 +29,7 @@ Any matching path selects every registered operator. Unrelated changes emit `sho
 The workflow has no top-level path filter, so unrelated changes still produce a selection result.
 The caller passes the selected `test/ci/ut/npu-operators.yaml` task to `.github/workflows/run-ci-task-matrix.yml`, using the dedicated NPU runner label. This shared workflow invokes `test/ci_system/pipeline.py` in the existing NPU environment; the task has no dependency-install stage or Docker requirement.
 NPU CI implementation and operator tests remain under `ci/npu_ops_test/`; new operators do not require changes to GPU task lists.
+The dedicated `npu` matrix group selects only `tokenspeed-npu-arm64`; AMD MI350, AMD MI450, and NVIDIA groups exclude that runner. GPU path selection also ignores NPU-only task YAML changes.
 
 ## Components and execution order
 
