@@ -160,6 +160,15 @@ def parse_args(argv=None):
     return args
 
 
+def check_runtime_binary(binary, prefix):
+    path = Path(binary["path"]).resolve(strict=True)
+    if not path.is_relative_to(prefix.resolve(strict=True)):
+        raise ValueError("Runtime binary is outside this task's virtualenv")
+    with path.open("rb") as handle:
+        if hashlib.file_digest(handle, "sha256").hexdigest() != binary["sha256"]:
+            raise ValueError("Installed runtime binary identity mismatch")
+
+
 def check_install_evidence(path, source_sha):
     evidence = json.loads(path.read_text())
     if (
@@ -182,6 +191,7 @@ def check_install_evidence(path, source_sha):
     expected = {
         "tokenspeed": "python",
         "tokenspeed-scheduler": "tokenspeed-scheduler",
+        "tokenspeed-engine": "tokenspeed-engine",
         "tokenspeed-kernel": "tokenspeed-kernel/python",
         "tokenspeed-kernel-npu": "tokenspeed-kernel-npu",
     }
@@ -199,17 +209,13 @@ def check_install_evidence(path, source_sha):
             raise ValueError(f"Installed source provenance mismatch: {name}")
         if name == "tokenspeed-scheduler" and "binary" not in item:
             raise ValueError("Missing scheduler binary evidence")
-        binary = item.get("binary")
-        if binary and (
-            not Path(binary["path"])
-            .resolve()
-            .is_relative_to(Path(sys.prefix).resolve())
-            or hashlib.file_digest(
-                Path(binary["path"]).open("rb"), "sha256"
-            ).hexdigest()
-            != binary["sha256"]
-        ):
-            raise ValueError("Installed scheduler binary identity mismatch")
+        binaries = [item["binary"]] if "binary" in item else []
+        if name == "tokenspeed-engine":
+            if set(item.get("binaries", {})) != {"native", "host"}:
+                raise ValueError("Missing engine binary evidence")
+            binaries.extend(item["binaries"].values())
+        for binary in binaries:
+            check_runtime_binary(binary, Path(sys.prefix))
     return evidence
 
 
@@ -311,6 +317,8 @@ def worker(args):
                 "transformers",
                 "protobuf",
                 "tokenspeed-scheduler",
+                "tokenspeed-engine",
+                "tokenspeed-mooncake",
             )
         }
         result["stage"] = "native_npu"
@@ -359,6 +367,24 @@ def worker(args):
             raise RuntimeError(
                 "Loaded scheduler binary differs from installation evidence"
             )
+        import tokenspeed_engine
+        import tokenspeed_engine._native as engine_native
+
+        for label, filename in {
+            "native": engine_native.__file__,
+            "host": tokenspeed_engine.host_binary(),
+        }.items():
+            actual = require_source_path(filename, Path(sys.prefix))
+            if (
+                actual
+                != result["install"]["installed"]["tokenspeed-engine"]["binaries"][
+                    label
+                ]["path"]
+            ):
+                raise ValueError(
+                    "Loaded engine binary differs from installation evidence"
+                )
+            result["imports"][f"engine_{label}"] = actual
         model = args.model.resolve(strict=True)
         result["model_manifest_sha256"] = check_model(
             model, args.model_id, args.model_revision, args.manifest_sha256

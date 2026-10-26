@@ -260,8 +260,24 @@ requirements change, refresh and validate a new protected wheel set before
 updating the deployment path. The task records the manifest digest and file
 hashes in `runtime/dependency-wheelhouse.json`, alongside pip's install report.
 This dependency deployment does not reuse source checkouts, built project wheels,
-compiled kernels or virtualenvs between runs. All four repository components are
+compiled kernels or virtualenvs between runs. All five repository components, including `tokenspeed-engine`, are
 still built from the event checkout. The operator environment stays unchanged.
+
+The deployment JSON also requires `engine_dependencies`, a protected root-owned
+bundle containing `rust/`, `vendor/`, `xgrammar/`, and `manifest.json`. The manifest
+binds every regular file by SHA256, the exact Rust version, the checkout's
+`tokenspeed-engine/Cargo.lock`, and its xgrammar CMake declaration. Symlinks,
+mutable files, extra files and source/dependency mismatches fail before building.
+Refresh this bundle when the engine's locked dependencies or grammar source changes.
+
+Engine installation runs Cargo with the locked dependency set, offline vendored
+sources, and the protected xgrammar source. Cargo configuration and compilation
+outputs remain under this job's work directory and are removed with it; no
+repository wheel or compiled engine is reused across runs. Installation evidence
+records both ARM64 ELF binaries (`_native` and `ts-host`), their hashes and dynamic
+libraries. The smoke checks their installed identities before real inference.
+Mooncake comes from the complete verified ARM64 wheel set and must satisfy the
+current checkout's requirement; missing versions never fall back to PyPI.
 
 The runtime installation has a 1,800-second limit;
 the smoke test retains its separate 600-second limit. These limits bound
@@ -272,7 +288,7 @@ Its explicit NPU branch uses the configured bootstrap Python to prepare an
 independent `model-venv` under this task's work directory, before CUDA/ROCm
 dispatch or package-cache setup. `pipeline.py` prepares the native environment. CANN native/IR
 libraries remain available; CANN Python tooling and automatic CUDA migration
-are excluded. The task installs the full runtime, scheduler extension, shared
+are excluded. The task installs the full runtime, scheduler extension, Rust engine, shared
 kernel package and NPU kernel package from the exact event checkout. Normal
 package dependency resolution and `pip check` must pass; installation evidence
 records source URLs, versions and scheduler binary identity. The pytest lower

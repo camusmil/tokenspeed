@@ -796,7 +796,14 @@ def npu_runtime_environment(env, root, *, dry_run):
     ):
         raise ValueError("NPU deployment must be a root-owned protected regular file")
     deployment = json.loads(config.read_text())
-    for key in ("environment", "python", "wheels", "openssl_root", "model"):
+    for key in (
+        "environment",
+        "python",
+        "wheels",
+        "openssl_root",
+        "model",
+        "engine_dependencies",
+    ):
         value = Path(deployment[key])
         if not value.is_absolute() or not value.exists():
             raise ValueError(f"Missing NPU deployment path: {key}")
@@ -834,6 +841,8 @@ def npu_runtime_environment(env, root, *, dry_run):
         TOKENSPEED_CI_SOURCE_SHA=sha,
         NPU_CI_BOOTSTRAP_PYTHON=deployment["python"],
         NPU_CI_WHEELS=deployment["wheels"],
+        NPU_CI_ENGINE_DEPS=deployment["engine_dependencies"],
+        NPU_CI_OPENSSL_ROOT=deployment["openssl_root"],
         NPU_SMOKE_MODEL_PATH=deployment["model"],
         VIRTUAL_ENV=str(venv),
         PATH=f"{venv / 'bin'}{os.pathsep}{result['PATH']}",

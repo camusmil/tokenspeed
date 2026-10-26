@@ -1,5 +1,6 @@
 import json
 import os
+import runpy
 import shlex
 import shutil
 import subprocess
@@ -1805,3 +1806,96 @@ def test_ascend_cleanup_removes_only_its_job_directory(tmp_path):
     )
     assert not work.exists()
     assert (other / "evidence").read_text() == "preserve"
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "content",
+        "extra",
+        "symlink",
+        "writable-file",
+        "writable-directory",
+        "owner",
+        "source-lock",
+    ],
+)
+def test_engine_build_inputs_require_exact_protected_sources(tmp_path, damage):
+    import hashlib
+
+    bundle = tmp_path / "dependencies"
+    source = tmp_path / "checkout"
+    bundle.mkdir()
+    files = {
+        "vendor/fixture/lib.rs": b"immutable dependency",
+        "rust/bin/rustc": b"compiler",
+    }
+    for name, data in files.items():
+        path = bundle / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        path.chmod(0o644)
+    lock = source / "tokenspeed-engine/Cargo.lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_bytes(b"locked source dependencies")
+    grammar = lock.parent / "crates/ts-grammar/CMakeLists.txt"
+    grammar.parent.mkdir(parents=True)
+    grammar.write_bytes(b"pinned grammar source")
+    manifest = {
+        "schema_version": 1,
+        "files": {
+            name: hashlib.sha256(data).hexdigest() for name, data in files.items()
+        },
+        "cargo_lock_sha256": hashlib.sha256(lock.read_bytes()).hexdigest(),
+        "xgrammar_build_sha256": hashlib.sha256(grammar.read_bytes()).hexdigest(),
+        "rust_version": "fixture version",
+    }
+    (bundle / "manifest.json").write_text(json.dumps(manifest))
+    verify = npu_installer_functions()["verify_engine_dependencies"]
+    assert verify(bundle, source, owner_uid=os.getuid())["file_count"] == 2
+    path = bundle / "vendor/fixture/lib.rs"
+    if damage == "content":
+        path.write_bytes(b"unexpected change")
+    elif damage == "extra":
+        (bundle / "extra").write_text("unexpected input")
+    elif damage == "symlink":
+        target = tmp_path / "outside"
+        target.write_bytes(path.read_bytes())
+        path.unlink()
+        path.symlink_to(target)
+    elif damage == "writable-file":
+        path.chmod(0o666)
+    elif damage == "writable-directory":
+        path.parent.chmod(0o777)
+    elif damage == "source-lock":
+        lock.write_bytes(b"new dependency not yet provisioned")
+    owner = os.getuid() + 1 if damage == "owner" else os.getuid()
+    with pytest.raises(ValueError):
+        verify(bundle, source, owner_uid=owner)
+
+
+@pytest.mark.parametrize("damage", [None, "content", "outside"])
+def test_engine_binary_identity_requires_job_local_unchanged_files(tmp_path, damage):
+    import hashlib
+
+    prefix = tmp_path / "venv"
+    prefix.mkdir()
+    binary = prefix / "ts-host"
+    binary.write_bytes(b"recorded engine binary")
+    evidence = {
+        "path": str(binary),
+        "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+    }
+    check = runpy.run_path(
+        str(REPO_ROOT / "test/runtime/models/test_qwen3_npu_smoke.py")
+    )["check_runtime_binary"]
+    if damage == "content":
+        binary.write_bytes(b"unexpected binary")
+    elif damage == "outside":
+        binary.rename(tmp_path / "outside-engine")
+        binary.symlink_to(tmp_path / "outside-engine")
+    if damage:
+        with pytest.raises(ValueError):
+            check(evidence, prefix)
+    else:
+        check(evidence, prefix)

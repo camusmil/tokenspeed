@@ -28,6 +28,7 @@ from pathlib import Path
 PROJECTS = {
     "tokenspeed": "python",
     "tokenspeed-scheduler": "tokenspeed-scheduler",
+    "tokenspeed-engine": "tokenspeed-engine",
     "tokenspeed-kernel": "tokenspeed-kernel/python",
     "tokenspeed-kernel-npu": "tokenspeed-kernel-npu",
 }
@@ -85,6 +86,89 @@ def verify_wheelhouse(directory, *, owner_uid):
     }
 
 
+
+def verify_engine_dependencies(directory, source, *, owner_uid):
+    def protected(path):
+        info = path.lstat()
+        if (
+            not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode))
+            or info.st_uid != owner_uid
+            or info.st_mode & 0o022
+        ):
+            raise ValueError(f"Unprotected NPU engine build dependency: {path}")
+
+    protected(directory)
+    manifest_path = directory / "manifest.json"
+    protected(manifest_path)
+    raw = manifest_path.read_bytes()
+    manifest = json.loads(raw)
+    files = manifest["files"]
+    if manifest["schema_version"] != 1 or not isinstance(files, dict) or not files:
+        raise ValueError("Invalid NPU engine dependency manifest")
+    actual = set()
+    for path in directory.rglob("*"):
+        protected(path)
+        if path.is_file() and path != manifest_path:
+            actual.add(path.relative_to(directory).as_posix())
+    if actual != set(files):
+        raise ValueError("NPU engine dependencies differ from their manifest")
+    for name, expected in files.items():
+        relative = Path(name)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or not isinstance(expected, str)
+            or re.fullmatch("[0-9a-f]{64}", expected) is None
+        ):
+            raise ValueError(f"Invalid NPU engine dependency entry: {name}")
+        with (directory / relative).open("rb") as handle:
+            if hashlib.file_digest(handle, "sha256").hexdigest() != expected:
+                raise ValueError(f"NPU engine dependency digest mismatch: {name}")
+    for name, relative in {
+        "cargo_lock_sha256": "Cargo.lock",
+        "xgrammar_build_sha256": "crates/ts-grammar/CMakeLists.txt",
+    }.items():
+        with (source / "tokenspeed-engine" / relative).open("rb") as handle:
+            if hashlib.file_digest(handle, "sha256").hexdigest() != manifest[name]:
+                raise ValueError(f"Engine source needs refreshed dependencies: {relative}")
+    return {
+        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "file_count": len(files),
+        "rust_version": manifest["rust_version"],
+        "cargo_lock_sha256": manifest["cargo_lock_sha256"],
+        "xgrammar_build_sha256": manifest["xgrammar_build_sha256"],
+        "cargo_offline": True,
+    }
+
+
+def prepare_engine_build(root, work, directory):
+    evidence = verify_engine_dependencies(directory, root, owner_uid=0)
+    rust = directory / "rust"
+    version = subprocess.check_output([str(rust / "bin/rustc"), "--version"], text=True).strip()
+    if version != f"rustc {evidence['rust_version']}":
+        raise ValueError("NPU Rust compiler differs from the protected manifest")
+    cargo_home = work / "cache/cargo-home"
+    cargo_home.mkdir(parents=True, exist_ok=True)
+    (cargo_home / "config.toml").write_text(
+        '[source.crates-io]\nreplace-with = "vendored-sources"\n'
+        '[source.vendored-sources]\ndirectory = '
+        + json.dumps(str(directory / "vendor"))
+        + '\n[net]\noffline = true\n'
+    )
+    os.environ.update(
+        PATH=f"{rust / 'bin'}{os.pathsep}{os.environ['PATH']}",
+        CARGO_HOME=str(cargo_home),
+        CARGO_TARGET_DIR=str(work / "cache/cargo-target"),
+        CARGO_NET_OFFLINE="true",
+        CARGO_BUILD_JOBS="4",
+        FETCHCONTENT_SOURCE_DIR_XGRAMMAR=str(directory / "xgrammar"),
+        OPENSSL_DIR=os.environ["NPU_CI_OPENSSL_ROOT"],
+        CMAKE_PREFIX_PATH=os.pathsep.join(filter(None, [os.environ["NPU_CI_OPENSSL_ROOT"], os.environ.get("CMAKE_PREFIX_PATH", "")])),
+    )
+    (work / "runtime/engine-build-dependencies.json").write_text(json.dumps(evidence) + "\n")
+    print(f"Verified engine build dependencies: {evidence}", flush=True)
+
+
 def install_from_wheelhouse(python, wheels, requirements, *, options):
     subprocess.run(
         [
@@ -136,6 +220,7 @@ def install_runtime():
     install_from_wheelhouse(
         python, wheels, sorted(requirements), options=["--only-binary=:all:"]
     )
+    prepare_engine_build(root, work, Path(os.environ["NPU_CI_ENGINE_DEPS"]))
     install_from_wheelhouse(
         python,
         wheels,
@@ -163,6 +248,7 @@ from pathlib import Path
 PROJECTS = {
     "tokenspeed": "python",
     "tokenspeed-scheduler": "tokenspeed-scheduler",
+    "tokenspeed-engine": "tokenspeed-engine",
     "tokenspeed-kernel": "tokenspeed-kernel/python",
     "tokenspeed-kernel-npu": "tokenspeed-kernel-npu",
 }
@@ -223,6 +309,31 @@ def record_install():
                 "sha256": digest(binary),
                 "ldd": libraries,
             }
+        if name == "tokenspeed-engine":
+            import tokenspeed_engine
+            import tokenspeed_engine._native as native
+
+            item["binaries"] = {}
+            for label, binary in {
+                "native": Path(native.__file__),
+                "host": Path(tokenspeed_engine.host_binary()),
+            }.items():
+                binary = binary.resolve(strict=True)
+                if not binary.is_relative_to(Path(sys.prefix).resolve()):
+                    raise ValueError("Engine binary is outside this task's virtualenv")
+                with binary.open("rb") as handle:
+                    header = handle.read(20)
+                if header[:6] != b"\x7fELF\x02\x01" or int.from_bytes(header[18:20], "little") != 183:
+                    raise ValueError("Engine requires native Linux ARM64 ELF binaries")
+                libraries = subprocess.check_output(["ldd", str(binary)], text=True)
+                if "not found" in libraries:
+                    raise ValueError("Engine binary has missing libraries")
+                item["binaries"][label] = {
+                    "path": str(binary),
+                    "sha256": digest(binary),
+                    "machine": "aarch64",
+                    "ldd": libraries,
+                }
         installed[name] = item
     write_json(
         work / "runtime/install-evidence.json",

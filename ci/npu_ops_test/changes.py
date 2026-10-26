@@ -152,6 +152,7 @@ def select_model_suite(event_name: str, paths: set[str]) -> dict:
         ".github/scripts/ci_result_source.py",
         "python/**",
         "tokenspeed-scheduler/**",
+        "tokenspeed-engine/**",
         "tokenspeed-kernel/python/**",
         "tokenspeed-kernel-npu/**",
         "test/runtime/models/test_qwen3_npu_smoke.py",
