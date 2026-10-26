@@ -263,7 +263,12 @@ This dependency deployment does not reuse source checkouts, built project wheels
 compiled kernels or virtualenvs between runs. All five repository components, including `tokenspeed-engine`, are
 still built from the event checkout. The operator environment stays unchanged.
 
-The deployment JSON also requires `engine_dependencies`, a protected root-owned
+The deployment JSON requires `python_library_dir`, the actual directory of the
+configured CPython shared library. NPU builds write an explicit PyO3 configuration
+and set task-local link/runtime search paths for Python and OpenSSL; relocated
+Python installations must not rely on stale compiled-in `LIBDIR` metadata.
+
+It also requires `engine_dependencies`, a protected root-owned
 bundle containing `rust/`, `vendor/`, `xgrammar/`, and `manifest.json`. The manifest
 binds every regular file by SHA256, the exact Rust version, the checkout's
 `tokenspeed-engine/Cargo.lock`, and its xgrammar CMake declaration. Symlinks,
@@ -278,6 +283,14 @@ records both ARM64 ELF binaries (`_native` and `ts-host`), their hashes and dyna
 libraries. The smoke checks their installed identities before real inference.
 Mooncake comes from the complete verified ARM64 wheel set and must satisfy the
 current checkout's requirement; missing versions never fall back to PyPI.
+Before inference, the smoke records Mooncake's ARM64 transfer/store library
+hashes and attempts native loading. Loadable libraries must export the C symbols
+and ABI version required by the current Rust engine. Loading failures are
+recorded as `unavailable` with the original error. The published 20261026 ARM64
+wheel links CUDA libraries, so it does not provide PD/L3 compatibility on a
+pure NPU host. This smoke explicitly uses aggregated inference without PD or
+L3 storage; these optional libraries are not needed by that path. A successful
+Qwen test does not certify Mooncake PD/L3, RDMA or store-service compatibility.
 
 The runtime installation has a 1,800-second limit;
 the smoke test retains its separate 600-second limit. These limits bound

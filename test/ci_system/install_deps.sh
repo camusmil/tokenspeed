@@ -22,6 +22,8 @@ import os
 import re
 import stat
 import subprocess
+import sys
+import sysconfig
 import tomllib
 from pathlib import Path
 
@@ -155,7 +157,40 @@ def prepare_engine_build(root, work, directory):
         + json.dumps(str(directory / "vendor"))
         + '\n[net]\noffline = true\n'
     )
+    python_lib = Path(os.environ["NPU_CI_PYTHON_LIBDIR"])
+    library = sysconfig.get_config_var("LDLIBRARY")
+    if (
+        sys.implementation.name != "cpython"
+        or not sysconfig.get_config_var("Py_ENABLE_SHARED")
+        or sysconfig.get_config_var("Py_DEBUG")
+        or sysconfig.get_config_var("Py_GIL_DISABLED")
+        or not library
+        or not (python_lib / library).is_file()
+    ):
+        raise ValueError("Engine requires release CPython and its deployed shared library")
+    python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    pyo3 = work / "runtime/pyo3-config.txt"
+    pyo3.write_text(
+        "implementation=CPython\n"
+        f"version={python_version}\n"
+        "shared=true\n"
+        f"target_abi=CPython-gil_enabled-{python_version}\n"
+        f"lib_name=python{python_version}\n"
+        f"lib_dir={python_lib}\n"
+        f"executable={work / 'model-venv/bin/python'}\n"
+        "pointer_width=64\n"
+        "build_flags=\n"
+        "suppress_build_script_link_lines=false\n"
+    )
+    openssl = Path(os.environ["NPU_CI_OPENSSL_ROOT"])
+    crypto = next((p for p in (openssl / "lib", openssl / "lib64") if (p / "libcrypto.so").is_file()), None)
+    if crypto is None:
+        raise ValueError("Engine requires the deployed OpenSSL link library")
+    evidence["python_library_dir"] = str(python_lib)
+    evidence["openssl_library_dir"] = str(crypto)
     os.environ.update(
+        PYO3_CONFIG_FILE=str(pyo3),
+        LIBRARY_PATH=os.pathsep.join(filter(None, [str(python_lib), str(crypto), os.environ.get("LIBRARY_PATH", "")])),
         PATH=f"{rust / 'bin'}{os.pathsep}{os.environ['PATH']}",
         CARGO_HOME=str(cargo_home),
         CARGO_TARGET_DIR=str(work / "cache/cargo-target"),

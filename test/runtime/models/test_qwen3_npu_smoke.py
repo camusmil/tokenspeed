@@ -26,6 +26,7 @@ The NPU pipeline owns process supervision, locking, deadlines and archiving.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import importlib
 import importlib.metadata
@@ -158,6 +159,68 @@ def parse_args(argv=None):
     if not 1 <= args.max_new_tokens <= 64 or not 1024 <= args.port <= 65535:
         parser.error("smoke requires 1..64 generated tokens and port 1024..65535")
     return args
+
+
+def probe_mooncake(source):
+    distribution = importlib.metadata.distribution("tokenspeed-mooncake")
+    package = Path(distribution.locate_file("mooncake")).resolve(strict=True)
+    result = {
+        "version": distribution.version,
+        "required_by_test": False,
+        "scope": "aggregated single-NPU inference without PD or L3",
+        "status": "loadable",
+        "libraries": {},
+    }
+    for filename, rust_filename in {
+        "libtokenspeed_transfer_engine.so": "lib.rs",
+        "libmooncake_store.so": "store.rs",
+    }.items():
+        library_path = package / filename
+        require_source_path(library_path, Path(sys.prefix))
+        with library_path.open("rb") as handle:
+            header = handle.read(20)
+        if (
+            header[:6] != b"\x7fELF\x02\x01"
+            or int.from_bytes(header[18:20], "little") != 183
+        ):
+            raise ValueError("Mooncake requires native Linux ARM64 ELF libraries")
+        declaration = (
+            source / "tokenspeed-engine/crates/ts-mooncake/src" / rust_filename
+        ).read_text()
+        symbols = sorted(set(re.findall(r'\.get\(b"([A-Za-z0-9_]+)"\)', declaration)))
+        if not symbols:
+            raise ValueError("Missing engine Mooncake C API declarations")
+        with library_path.open("rb") as handle:
+            digest = hashlib.file_digest(handle, "sha256").hexdigest()
+        item = {
+            "path": str(library_path),
+            "sha256": digest,
+            "symbols": symbols,
+            "machine": "aarch64",
+        }
+        result["libraries"][filename] = item
+        try:
+            library = ctypes.CDLL(str(library_path))
+        except OSError as exc:
+            # Aggregated inference does not use either optional Mooncake library.
+            # Preserve the incompatibility; it is not a PD/L3 acceptance result.
+            item.update(status="unavailable", error=str(exc))
+            result["status"] = "unavailable"
+            continue
+        for symbol in symbols:
+            getattr(library, symbol)
+        if rust_filename == "lib.rs":
+            expected = int(
+                re.search(r"const ABI_VERSION: c_int = (\d+);", declaration)[1]
+            )
+            version = library.ts_mooncake_abi_version
+            version.argtypes = []
+            version.restype = ctypes.c_int
+            result["abi_version"] = version()
+            if result["abi_version"] != expected:
+                raise ValueError("Mooncake C API ABI differs from this engine source")
+        item["status"] = "loadable"
+    return result
 
 
 def check_runtime_binary(binary, prefix):
@@ -321,6 +384,8 @@ def worker(args):
                 "tokenspeed-mooncake",
             )
         }
+        result["stage"] = "mooncake_abi"
+        result["mooncake"] = probe_mooncake(args.source_root)
         result["stage"] = "native_npu"
         import torch
         import torch_npu  # noqa: F401
@@ -425,6 +490,8 @@ def worker(args):
             attention_backend="mha",
             sampling_backend=args.sampling_backend,
             grammar_backend="none",
+            disaggregation_mode="null",
+            kvstore_storage_backend=None,
             disable_prefill_graph=True,
             disable_pdl=True,
             disable_autotune=True,
@@ -448,6 +515,11 @@ def worker(args):
             listener.bind(("127.0.0.1", args.port))
         result["stage"] = "engine_create"
         engine = Engine(**engine_args)
+        if (
+            engine.server_args.disaggregation_mode != "null"
+            or engine.server_args.kvstore_storage_backend is not None
+        ):
+            raise RuntimeError("This smoke does not cover Mooncake PD or L3 storage")
         if engine.server_args.device != "npu":
             raise RuntimeError("Engine did not select the native NPU device")
         result["stage"] = "generate"
@@ -544,6 +616,10 @@ def test_qwen3_npu_smoke():
             )
             handle.write(
                 "Smoke checks execution and bounded nonempty output. Accuracy and performance thresholds are not evaluated.\n"
+            )
+            handle.write(
+                f"\nMooncake native libraries: `{result['mooncake']['status']}`. "
+                "This aggregated test does not use PD or L3 storage; their NPU compatibility is not certified.\n"
             )
 
 

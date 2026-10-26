@@ -803,6 +803,7 @@ def npu_runtime_environment(env, root, *, dry_run):
         "openssl_root",
         "model",
         "engine_dependencies",
+        "python_library_dir",
     ):
         value = Path(deployment[key])
         if not value.is_absolute() or not value.exists():
@@ -835,6 +836,18 @@ def npu_runtime_environment(env, root, *, dry_run):
         "HF_TOKEN",
     ):
         result.pop(name, None)
+    library_paths = [deployment["python_library_dir"]]
+    library_paths.extend(
+        str(p)
+        for p in (
+            Path(deployment["openssl_root"]) / "lib",
+            Path(deployment["openssl_root"]) / "lib64",
+        )
+        if p.is_dir()
+    )
+    result["LD_LIBRARY_PATH"] = os.pathsep.join(
+        library_paths + [result.get("LD_LIBRARY_PATH", "")]
+    )
     venv = work / "model-venv"
     result.update(
         NPU_CI_SOURCE_ROOT=str(root),
@@ -843,6 +856,7 @@ def npu_runtime_environment(env, root, *, dry_run):
         NPU_CI_WHEELS=deployment["wheels"],
         NPU_CI_ENGINE_DEPS=deployment["engine_dependencies"],
         NPU_CI_OPENSSL_ROOT=deployment["openssl_root"],
+        NPU_CI_PYTHON_LIBDIR=deployment["python_library_dir"],
         NPU_SMOKE_MODEL_PATH=deployment["model"],
         VIRTUAL_ENV=str(venv),
         PATH=f"{venv / 'bin'}{os.pathsep}{result['PATH']}",
