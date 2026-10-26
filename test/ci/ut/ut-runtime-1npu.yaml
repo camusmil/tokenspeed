@@ -7,7 +7,7 @@ triggers:
   - manual
 runner:
   labels:
-    - tokenspeed-npu-arm64
+    - ascend-npu-ops-test
 env:
   CI: "true"
   NPU_CI_RUNTIME: "true"

@@ -7,7 +7,7 @@ triggers:
   - manual
 runner:
   labels:
-    - tokenspeed-npu-arm64
+    - ascend-npu-ops-test
 ut:
   commands:
     - bash ci/npu_ops_test/run_step.sh accuracy "$NPU_CI_WORK"

@@ -9,10 +9,10 @@ The `select` job can run in an allowed repository. The hardware job additionally
 When that variable is absent or disabled, the hardware job is skipped without entering a runner queue. A positive selection result does not mean the operators have run.
 The NPU allowlist uses its own `TOKENSPEED_NPU_CI_REPOSITORY` variable; it does not require the shared repository variable used by GPU workflows, so enabling NPU CI does not also enable other vendors' scheduling.
 
-Supported PR events are `opened`, `synchronize`, `reopened`, `ready_for_review`, and `labeled`. Only the `high priority` label triggers a run on a labeling event. Draft PRs do not start the NPU job.
-The label does not change the order: accuracy always precedes performance.
+Supported PR events are `opened`, `synchronize`, `reopened`, and `ready_for_review`. Draft PRs do not start the NPU job.
+Accuracy always precedes performance.
 The independent `pr-test-npu-arm` concurrency group is keyed by PR or ref. Automatic events cancel older runs in the same group; manual events do not initiate cancellation.
-Unrelated label events use a separate group to avoid canceling an active test run. Test code never runs through `pull_request_target`.
+Test code never runs through `pull_request_target`.
 
 The GitHub-hosted `select` job checks out the event commit, runs the CPU-only API regression tests with `python3 -B -m unittest ci.npu_ops_test.test_changes`, then runs `ci/npu_ops_test/changes.py`. Selection uses the same GitHub API change-list checks as the independent NPU workflow:
 
@@ -29,6 +29,7 @@ Any matching path selects every registered operator. Unrelated changes emit `sho
 The workflow has no top-level path filter, so unrelated changes still produce a selection result.
 The caller passes the selected `test/ci/ut/npu-operators.yaml` task to `.github/workflows/run-ci-task-matrix.yml`, using the dedicated NPU runner label. This shared workflow invokes `test/ci_system/pipeline.py` in the existing NPU environment; the task has no dependency-install stage or Docker requirement.
 NPU CI implementation and operator tests remain under `ci/npu_ops_test/`; new operators do not require changes to GPU task lists.
+The dedicated `npu` matrix group selects only `ascend-npu-ops-test`; AMD MI350, AMD MI450, and NVIDIA groups exclude that runner. GPU path selection also ignores NPU-only task YAML changes.
 
 
 ## GitHub source reads and retries
@@ -96,10 +97,10 @@ Source recording, artifact upload, and work-directory cleanup use the shared wor
 
 ## Runner deployment contract and evidence locations
 
-`runs-on` uses the common `tokenspeed-npu-arm64` scheduling label, without adding the default `self-hosted` label.
-Runners identified by either `tokenspeed-npu-arm64` or the older `ascend-npu-ops-test` label join the same pool by carrying `tokenspeed-npu-arm64`.
-Keep `ascend-npu-ops-test` if other workflows use it. Each operator or runtime task has one matrix entry and executes once, on any available eligible runner.
-Do not append the older label to `runner.labels`: the shared scanner creates a separate task for each label. A GitHub `runs-on` label array instead requires every listed label; it does not express alternatives.
+`runs-on` uses the common `ascend-npu-ops-test` scheduling label, without adding the default `self-hosted` label.
+Runners previously identified by `tokenspeed-npu-arm64` join the same pool by adding `ascend-npu-ops-test`; the previous label may remain for other workflows.
+Each operator or runtime task has one matrix entry and executes once, on any available eligible runner.
+Do not append another label to `runner.labels`: the shared scanner creates a separate task for each label. A GitHub `runs-on` label array instead requires every listed label; it does not express alternatives.
 The hardware job is disabled by default. These are deployment requirements, not assertions that upstream already has a runner, NPU, or configured runtime.
 From the repository home page, open **Settings > Secrets and variables > Actions > Variables** and configure these repository variables:
 
@@ -111,7 +112,7 @@ From the repository home page, open **Settings > Secrets and variables > Actions
 | `TOKENSPEED_NPU_ARM_CI_ENABLED` | Set to `true` only after deployment requirements are met; leave unset to disable the hardware job |
 
 Assign the dedicated label to an online Linux ARM64 NPU runner running under the `ci-npu` service account.
-For additional machines, open **Settings > Actions > Runners > the runner > Labels**, add `tokenspeed-npu-arm64`, and retain its existing labels.
+For additional machines, open **Settings > Actions > Runners > the runner > Labels**, add `ascend-npu-ops-test`, and retain its existing labels.
 Add every eligible runner name to `TOKENSPEED_NPU_ARM_RUNNER_NAMES`, including the current runner. Names are matched literally, not as substrings or wildcard patterns.
 For example, two prepared machines can use this variable value:
 

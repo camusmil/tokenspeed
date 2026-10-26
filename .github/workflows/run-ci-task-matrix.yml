@@ -65,7 +65,7 @@ jobs:
       TOKENSPEED_CI_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
     steps:
       - name: Check NPU runner environment
-        if: matrix.runner == 'tokenspeed-npu-arm64'
+        if: matrix.runner == 'ascend-npu-ops-test'
         env:
           NPU_RUNNER_NAMES: ${{ vars.TOKENSPEED_NPU_ARM_RUNNER_NAMES || vars.TOKENSPEED_NPU_ARM_RUNNER_NAME }}
           NPU_REPOSITORY: ${{ vars.TOKENSPEED_NPU_CI_REPOSITORY }}
@@ -88,7 +88,7 @@ jobs:
           [[ "$(id -un)" = ci-npu && "$RUNNER_ENVIRONMENT" = self-hosted ]] || { echo 'The self-hosted ci-npu user is required' >&2; exit 1; }
           [[ "$TASK_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || { echo 'Invalid task name' >&2; exit 1; }
           /srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python3 -B -c 'import yaml'
-          work="$GITHUB_WORKSPACE/run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${TASK_NAME}-tokenspeed-npu-arm64"
+          work="$GITHUB_WORKSPACE/run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${TASK_NAME}-ascend-npu-ops-test"
           echo "NPU_CI_WORK=$work" >> "$GITHUB_ENV"
           echo "WORK_DIR=$work/checkout" >> "$GITHUB_ENV"
           echo 'PYTHONDONTWRITEBYTECODE=1' >> "$GITHUB_ENV"
@@ -96,7 +96,7 @@ jobs:
           echo /srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin >> "$GITHUB_PATH"
 
       - name: Prepare NPU source and reporter
-        if: matrix.runner == 'tokenspeed-npu-arm64'
+        if: matrix.runner == 'ascend-npu-ops-test'
         env:
           NPU_SOURCE_SHA: ${{ inputs.checkout_ref || github.sha }}
           NPU_SOURCE_DIR: ${{ env.WORK_DIR }}
@@ -139,18 +139,18 @@ jobs:
           fi
 
       - name: Checkout code
-        if: matrix.runner != 'tokenspeed-npu-arm64'
+        if: matrix.runner != 'ascend-npu-ops-test'
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref || github.sha }}
           fetch-depth: ${{ matrix.workflow_stage == 'kernel-benchmark' && '0' || '1' }}
-          persist-credentials: ${{ matrix.runner != 'tokenspeed-npu-arm64' && matrix.workflow_stage != 'kernel-benchmark' }}
-          path: run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}${{ matrix.runner == 'tokenspeed-npu-arm64' && '/checkout' || '' }}
+          persist-credentials: ${{ matrix.runner != 'ascend-npu-ops-test' && matrix.workflow_stage != 'kernel-benchmark' }}
+          path: run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}${{ matrix.runner == 'ascend-npu-ops-test' && '/checkout' || '' }}
 
       - name: Set work directory
         run: |
           work_dir="${{ github.workspace }}/run-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.name }}-${{ matrix.runner }}"
-          if [ "${{ matrix.runner }}" = tokenspeed-npu-arm64 ]; then
+          if [ "${{ matrix.runner }}" = ascend-npu-ops-test ]; then
             work_dir="$NPU_CI_WORK/checkout"
           fi
           echo "WORK_DIR=$work_dir" >> "$GITHUB_ENV"
@@ -190,7 +190,7 @@ jobs:
           key: mi450-sim-${{ runner.os }}-rocjitsu-9083cc2a-rocm-20260822-v1
 
       - name: Install pipeline dependency
-        if: matrix.runner != 'tokenspeed-npu-arm64'
+        if: matrix.runner != 'ascend-npu-ops-test'
         # pypi.org occasionally returns "Content-Type: Unknown" for the simple
         # index, which strict pip>=22 refuses to parse. Retry a few times.
         run: |
@@ -202,7 +202,7 @@ jobs:
           exit 1
 
       - name: Install CI task
-        if: matrix.runner != 'tokenspeed-npu-arm64' || matrix.npu_runtime == true
+        if: matrix.runner != 'ascend-npu-ops-test' || matrix.npu_runtime == true
         run: |
           cd "${{ env.WORK_DIR }}"
           mkdir -p .ci-artifacts
@@ -231,7 +231,7 @@ jobs:
         run: |
           cd "${{ env.WORK_DIR }}"
           # NPU run_step.sh checks a clean checkout before each phase.
-          if [ "${{ matrix.runner }}" != tokenspeed-npu-arm64 ]; then
+          if [ "${{ matrix.runner }}" != ascend-npu-ops-test ]; then
             mkdir -p .ci-artifacts
           fi
           python3 test/ci_system/pipeline.py execute \
@@ -244,7 +244,7 @@ jobs:
             --result-json .ci-artifacts/result.json
 
       - name: Checkout source reporter
-        if: ${{ always() && matrix.runner != 'tokenspeed-npu-arm64' }}
+        if: ${{ always() && matrix.runner != 'ascend-npu-ops-test' }}
         uses: actions/checkout@v7
         with:
           ref: ${{ github.workflow_sha }}
@@ -254,7 +254,7 @@ jobs:
           persist-credentials: false
 
       - name: Record NPU checked-out source
-        if: ${{ always() && matrix.runner == 'tokenspeed-npu-arm64' && env.NPU_SOURCE_REPORTER != '' }}
+        if: ${{ always() && matrix.runner == 'ascend-npu-ops-test' && env.NPU_SOURCE_REPORTER != '' }}
         env:
           EXPECTED_SOURCE: ${{ inputs.checkout_ref || github.sha }}
           CONFIG: ${{ matrix.config }}
@@ -266,7 +266,7 @@ jobs:
             --expected "$EXPECTED_SOURCE" --config "$CONFIG" --runner "$RUNNER"
 
       - name: Record checked-out source
-        if: ${{ always() && matrix.runner != 'tokenspeed-npu-arm64' }}
+        if: ${{ always() && matrix.runner != 'ascend-npu-ops-test' }}
         env:
           EXPECTED_SOURCE: ${{ inputs.checkout_ref || github.sha }}
           CONFIG: ${{ matrix.config }}
@@ -277,7 +277,7 @@ jobs:
           --config "$CONFIG" --runner "$RUNNER"
 
       - name: Collect NPU reports
-        if: ${{ always() && matrix.runner == 'tokenspeed-npu-arm64' && env.NPU_CI_WORK != '' }}
+        if: ${{ always() && matrix.runner == 'ascend-npu-ops-test' && env.NPU_CI_WORK != '' }}
         run: |
           destination="$WORK_DIR/.ci-artifacts/published/npu"
           mkdir -p "$destination"
@@ -288,7 +288,7 @@ jobs:
           done
 
       - name: Upload task result
-        if: ${{ always() && (matrix.runner != 'tokenspeed-npu-arm64' || env.NPU_CI_WORK != '') }}
+        if: ${{ always() && (matrix.runner != 'ascend-npu-ops-test' || env.NPU_CI_WORK != '') }}
         uses: actions/upload-artifact@v4
         with:
           name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -299,7 +299,7 @@ jobs:
           include-hidden-files: true
 
       - name: Upload task logs on failure
-        if: ${{ failure() && (matrix.runner != 'tokenspeed-npu-arm64' || env.NPU_CI_WORK != '') }}
+        if: ${{ failure() && (matrix.runner != 'ascend-npu-ops-test' || env.NPU_CI_WORK != '') }}
         uses: actions/upload-artifact@v4
         with:
           name: pr-test-${{ matrix.name }}-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}-logs
@@ -312,12 +312,12 @@ jobs:
       - name: Cleanup work directory
         if: always()
         run: |
-          if [ "${{ matrix.runner }}" = tokenspeed-npu-arm64 ] && [ -z "${NPU_CI_WORK:-}" ]; then
+          if [ "${{ matrix.runner }}" = ascend-npu-ops-test ] && [ -z "${NPU_CI_WORK:-}" ]; then
             exit 0
           fi
           case "${{ matrix.runner }}" in
             gb200*) python3 "${{ env.WORK_DIR }}/test/ci_system/process_group_manager.py" cleanup-stale || true ;;
-            tokenspeed-npu-arm64) rm -rf "$NPU_CI_WORK" ;;
+            ascend-npu-ops-test) rm -rf "$NPU_CI_WORK" ;;
           esac
           rm -rf "${{ env.WORK_DIR }}"
           rm -rf "${{ env.WORK_DIR }}-source"

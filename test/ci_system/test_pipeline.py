@@ -1446,6 +1446,45 @@ def test_execute_task_retries_eval_after_command_failure(monkeypatch, tmp_path):
     assert result_json.exists()
 
 
+@pytest.mark.parametrize(
+    ("group", "expected"),
+    [
+        ("npu", ["ascend-npu-ops-test"]),
+        ("amd-mi350", ["amd-mi35x-1gpu-test"]),
+        ("amd-mi450", ["amd-mi450-1gpu", "amd-mi45x-cpu-test"]),
+        ("amd", ["amd-mi35x-1gpu-test", "amd-mi450-1gpu", "amd-mi45x-cpu-test"]),
+        ("nvidia", ["h100-1gpu", "gb300-1gpu"]),
+        ("nvidia-arm", ["gb300-1gpu"]),
+        ("nvidia-x86", ["h100-1gpu"]),
+    ],
+)
+def test_build_matrix_keeps_npu_separate_from_gpu_groups(
+    tmp_path, monkeypatch, group, expected
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    _write_task_yaml(
+        tmp_path,
+        "vendors.yaml",
+        _default_body(
+            "ut-vendors",
+            [
+                "ascend-npu-ops-test",
+                "amd-mi35x-1gpu-test",
+                "amd-mi450-1gpu",
+                "amd-mi45x-cpu-test",
+                "h100-1gpu",
+                "gb300-1gpu",
+            ],
+        ),
+    )
+    args = parse_args(["scan", "--runner-group", group])
+    matrix = build_matrix(
+        tmp_path, tmp_path, trigger="per-commit", runner_group=args.runner_group
+    )
+
+    assert [entry["runner"] for entry in matrix["include"]] == expected
+
+
 def test_build_matrix_default_priority_preserves_existing_order(tmp_path):
     # Two tasks; both omit `priority`. Order must match the existing
     # behaviour: alphabetical by file path, then label order from the yaml.
@@ -1521,7 +1560,7 @@ def test_build_matrix_selects_kernel_benchmark_stage(tmp_path):
         tmp_path,
         tmp_path,
         trigger="per-commit",
-        runner_group="amd",
+        runner_group="amd-mi350",
         workflow_stage="kernel-benchmark",
     )
 
@@ -1592,7 +1631,7 @@ def test_build_matrix_can_select_or_exclude_multi_node_tasks(tmp_path):
         tmp_path,
         tmp_path,
         trigger="per-commit",
-        runner_group="amd",
+        runner_group="amd-mi350",
     ) == {"include": []}
 
 
@@ -2104,7 +2143,7 @@ def test_npu_runtime_failure_stops_later_commands(tmp_path, monkeypatch, failure
         "type": "ut",
         "workflow_stage": "unit-test",
         "triggers": ["manual"],
-        "runner": {"labels": ["tokenspeed-npu-arm64"]},
+        "runner": {"labels": ["ascend-npu-ops-test"]},
         "env": {
             "NPU_CI_RUNTIME": "true",
             "NPU_CI_WORK": str(tmp_path),
@@ -2122,7 +2161,7 @@ def test_npu_runtime_failure_stops_later_commands(tmp_path, monkeypatch, failure
     assert (
         pipeline.execute_task(
             config="task.yaml",
-            runner="tokenspeed-npu-arm64",
+            runner="ascend-npu-ops-test",
             work_dir=str(tmp_path),
             dry_run=False,
             print_plan=False,
@@ -2139,3 +2178,9 @@ def test_npu_runtime_failure_stops_later_commands(tmp_path, monkeypatch, failure
 
     with lock.open("r+") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.parametrize("group", ["amd", "nvidia", "nvidia-arm", "nvidia-x86"])
+def test_ascend_runner_is_isolated_from_gpu_groups(group):
+    assert runner_matches_group("ascend-npu-ops-test", "npu")
+    assert not runner_matches_group("ascend-npu-ops-test", group)

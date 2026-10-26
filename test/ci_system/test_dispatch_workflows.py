@@ -21,7 +21,8 @@ SLURM_RUNNER_PREFIXES = (
     "slurm-gb300-",
 )
 PR_TEST_WORKFLOWS = (
-    "amd-tests.yml",
+    "amd-mi350-tests.yml",
+    "amd-mi450-tests.yml",
     "nvidia-b200-tests.yml",
     "pr-test-nvidia-arm.yml",
 )
@@ -354,7 +355,7 @@ def test_runtime_1gpu_tasks_run_every_partition_once_per_runner():
 def test_amd_kernel_benchmarks_run_in_their_own_workflow():
     # AMD Tests keeps unit and model tests; the benchmark lives in a separate
     # workflow so it starts alongside unit tests and completes on its own.
-    tests = load_yaml(REPO_ROOT / ".github/workflows/amd-tests.yml")["jobs"]
+    tests = load_yaml(REPO_ROOT / ".github/workflows/amd-mi350-tests.yml")["jobs"]
     assert "kernel-benchmark" not in tests
     assert "kernel-benchmark" not in tests["finish"]["needs"]
     assert (
@@ -369,8 +370,6 @@ def test_amd_kernel_benchmarks_run_in_their_own_workflow():
     workflow = load_yaml(REPO_ROOT / ".github/workflows/amd-kernel-benchmark.yml")
     assert workflow["name"] == "AMD Kernel Benchmark"
     triggers = workflow.get("on") or workflow.get(True)
-    # The `high priority` label only affects model tests; it must not restart
-    # the benchmark.
     assert "labeled" not in triggers["pull_request"]["types"]
     # tokenspeed-mla is NVIDIA-only, so its changes must not start the workflow.
     for event in ("push", "pull_request"):
@@ -1502,7 +1501,7 @@ def test_reporter_is_offline_pinned_and_rejects_tampering(npu_source, tmp_path):
         WORK_DIR=str(repo),
         EXPECTED_SOURCE=candidate,
         CONFIG="test/ci/ut/ut-runtime-1npu.yaml",
-        RUNNER="tokenspeed-npu-arm64",
+        RUNNER="ascend-npu-ops-test",
     )
     record = npu_step_script(
         "run-ci-task-matrix.yml", "test", "Record NPU checked-out source"
@@ -1559,7 +1558,7 @@ def test_runtime_install_entry_preserves_interpreter_arguments_and_status(
             os.environ,
             NPU_CI_BOOTSTRAP_PYTHON=str(interpreter),
             NPU_CI_WORK=str(tmp_path),
-            CI_RUNNER_LABEL="tokenspeed-npu-arm64",
+            CI_RUNNER_LABEL="ascend-npu-ops-test",
             NPU_CI_RUNTIME="true",
         ),
         cwd=REPO_ROOT,
@@ -1752,4 +1751,57 @@ def test_npu_pool_schedules_each_suite_once():
         "npu-operators": 1,
         "ut-runtime-1npu": 1,
     }
-    assert {entry["runner"] for entry in matrix["include"]} == {"tokenspeed-npu-arm64"}
+    assert {entry["runner"] for entry in matrix["include"]} == {"ascend-npu-ops-test"}
+
+
+def test_k8s_dispatch_does_not_schedule_npu_tasks(tmp_path):
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/k8s-dispatch.yml")
+    step = next(
+        step
+        for step in workflow["jobs"]["scan"]["steps"]
+        if step.get("name") == "Build task matrix"
+    )
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "YAML_SELECTION": "all",
+            "TASK_TYPES": "ut",
+            "RUNNER_POOL": "all",
+            "EXACT_RUNNER": "",
+            "MATCH": "",
+            "TRIGGER": "per-commit",
+            "INCLUDE_MMLU": "false",
+            "GITHUB_OUTPUT": str(output),
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    entries = json.loads(values["matrix"])["include"]
+    assert entries
+    assert all(entry["runner"] != "ascend-npu-ops-test" for entry in entries)
+    assert not {"npu-operators", "ut-runtime-1npu"}.intersection(
+        entry["name"] for entry in entries
+    )
+
+
+def test_ascend_cleanup_removes_only_its_job_directory(tmp_path):
+    work = tmp_path / "current-job"
+    checkout = work / "checkout"
+    checkout.mkdir(parents=True)
+    (work / "evidence").write_text("current job")
+    other = tmp_path / "another-job"
+    other.mkdir()
+    (other / "evidence").write_text("preserve")
+    script = npu_step_script("run-ci-task-matrix.yml", "test", "Cleanup work directory")
+    script = script.replace("${{ matrix.runner }}", "ascend-npu-ops-test")
+    script = script.replace("${{ env.WORK_DIR }}", str(checkout))
+    subprocess.run(
+        ["bash", "-c", script], env={**os.environ, "NPU_CI_WORK": str(work)}, check=True
+    )
+    assert not work.exists()
+    assert (other / "evidence").read_text() == "preserve"

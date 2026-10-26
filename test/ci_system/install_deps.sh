@@ -11,7 +11,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Native NPU installation bypasses CUDA/ROCm and their package caches.
-if [[ "${CI_RUNNER_LABEL:-}" == tokenspeed-npu-arm64 ]]; then
+if [[ "${CI_RUNNER_LABEL:-}" == ascend-npu-ops-test ]]; then
     set -Eeuo pipefail
     [[ "${NPU_CI_RUNTIME:-}" == true ]] || { echo 'NPU runtime task required' >&2; exit 1; }
     [[ $# == 0 ]] || { echo 'NPU installation accepts no arguments' >&2; exit 1; }
@@ -437,6 +437,8 @@ pip_install_with_retry pip3 install --force-reinstall --no-deps \
     tokenspeed-scheduler/ \
     --config-settings="build-dir=${SCHEDULER_BUILD_DIR}"
 rm -rf "${SCHEDULER_BUILD_DIR}"
+echo "=== Step 5b: Install TokenSpeed Engine ==="
+WORKSPACE="${WORKSPACE}" bash "${SCRIPT_DIR}/install_tokenspeed_engine.sh"
 
 # ============================================================
 # Step 6: Install TokenSpeed
