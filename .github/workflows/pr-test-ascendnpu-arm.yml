@@ -49,14 +49,49 @@ jobs:
       should_run: ${{ steps.changes.outputs.should_run }}
       reason: ${{ steps.changes.outputs.reason }}
       matrix: ${{ steps.scan.outputs.matrix || '{"include":[]}' }}
+      model_should_run: ${{ steps.changes.outputs.model_should_run }}
+      model_matrix: ${{ steps.scan.outputs.model_matrix || '{"include":[]}' }}
     steps:
       - name: Check out event commit
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 1
-          persist-credentials: false
-      - name: Select operator tests
+        env:
+          NPU_SOURCE_SHA: ${{ github.sha }}
+          NPU_SOURCE_DIR: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          export GIT_TERMINAL_PROMPT=0
+          [[ "$GITHUB_SERVER_URL" = https://github.com ]] || { echo 'Unsupported GitHub server' >&2; exit 1; }
+          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || exit 1
+          [[ "$NPU_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'An immutable checkout SHA is required' >&2; exit 1; }
+          mkdir -p "$NPU_SOURCE_DIR"
+          [[ -z "$(ls -A "$NPU_SOURCE_DIR")" ]] || { echo 'Checkout directory must be empty' >&2; exit 1; }
+          git init "$NPU_SOURCE_DIR"
+          cd "$NPU_SOURCE_DIR"
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          # Bootstrap runs before repository helpers are available.
+          for attempt in 1 2 3 4; do
+            echo "GitHub source fetch attempt $attempt/4"
+            if git -c credential.helper= -c http.extraheader= fetch --no-tags --depth=1 origin "$NPU_SOURCE_SHA"; then
+              break
+            else
+              status=$?
+              echo "GitHub source fetch attempt $attempt/4 failed (exit=$status)" >&2
+              case "$status" in 130|143) exit "$status" ;; esac
+              [[ "$attempt" != 4 ]] || exit "$status"
+              echo 'Retrying GitHub read in 30 seconds' >&2
+              sleep 30
+            fi
+          done
+          git checkout --detach "$NPU_SOURCE_SHA"
+          [[ "$(git rev-parse HEAD)" = "$NPU_SOURCE_SHA" ]] || exit 1
+          [[ -z "$(git status --porcelain --untracked-files=all)" ]] || { echo 'Checkout is not clean' >&2; exit 1; }
+          if [[ -n "${NPU_REPORTER_DIR:-}" ]]; then
+            python3 -B .github/scripts/ci_result_source.py prepare --repo "$PWD" \
+              --workflow-sha "$NPU_WORKFLOW_SHA" --directory "$NPU_REPORTER_DIR" \
+              --github-env "$GITHUB_ENV"
+          fi
+      - name: Select operator and runtime tests
         id: changes
         shell: bash
         env:
@@ -75,7 +110,10 @@ jobs:
 
       - name: Scan shared CI tasks
         id: scan
-        if: steps.changes.outputs.should_run == 'true'
+        if: steps.changes.outputs.should_run == 'true' || steps.changes.outputs.model_should_run == 'true'
+        env:
+          OPERATOR_SELECTED: ${{ steps.changes.outputs.should_run }}
+          MODEL_SELECTED: ${{ steps.changes.outputs.model_should_run }}
         run: |
           python3 -m pip install PyYAML==6.0.3
           case "$GITHUB_EVENT_NAME" in
@@ -88,7 +126,33 @@ jobs:
             --repo-root "$GITHUB_WORKSPACE" --runner-group npu \
             --workflow-stage unit-test --trigger "$trigger")
           echo "$matrix" | jq -e '.include | length > 0' >/dev/null
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          export MATRIX="$matrix"
+          python3 - <<'PYTHON'
+          import json, os
+          entries = json.loads(os.environ["MATRIX"])["include"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              for name, runtime, selected in (("matrix", False, "OPERATOR_SELECTED"), ("model_matrix", True, "MODEL_SELECTED")):
+                  items = [item for item in entries if item.get("npu_runtime", False) == runtime] if os.environ[selected] == "true" else []
+                  if os.environ[selected] == "true" and not items:
+                      raise ValueError(f"Selected NPU task group is empty: {name}")
+                  output.write(f"{name}={json.dumps({'include': items})}\n")
+          PYTHON
+
+      - name: Test shared CI and Linux command lifecycle
+        if: steps.changes.outputs.should_run == 'true' || steps.changes.outputs.model_should_run == 'true'
+        env:
+          PYTHONPATH: .:test/ci_system
+        run: |
+          python3 -m pip install 'pytest>=9,<10'
+          python3 -B -m pytest --noconftest -q \
+            test/ci_system/test_pipeline.py \
+            test/ci_system/test_ci_path_filter.py \
+            test/ci_system/test_process_group_manager.py \
+            test/ci_system/test_dispatch_workflows.py \
+            test/ci_system/test_package_cache.py \
+            test/ci_system/test_cuda_install_validation.py \
+            test/runtime/models/test_qwen3_npu_smoke.py::test_invalid_qwen_output_is_a_failure \
+            test/runtime/models/test_qwen3_npu_smoke.py::test_qwen_accepts_bounded_tokens_and_valid_finish
 
   npu:
     name: Ascend NPU ARM operator tests
@@ -103,3 +167,21 @@ jobs:
       install_tokenspeed_mla_from_source: ${{ 'false' }}
       checkout_ref: ${{ github.sha }}
       timeout_minutes: 60
+
+  npu-runtime:
+    name: Ascend NPU ARM runtime smoke
+    needs: [select, npu]
+    if: |
+      always() && !cancelled() &&
+      vars.TOKENSPEED_NPU_ARM_CI_ENABLED == 'true' &&
+      needs.select.result == 'success' &&
+      needs.select.outputs.model_should_run == 'true' &&
+      (needs.npu.result == 'success' ||
+       (needs.npu.result == 'skipped' && needs.select.outputs.should_run != 'true')) &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    uses: ./.github/workflows/run-ci-task-matrix.yml
+    with:
+      matrix: ${{ needs.select.outputs.model_matrix }}
+      install_tokenspeed_mla_from_source: ${{ 'false' }}
+      checkout_ref: ${{ github.sha }}
+      timeout_minutes: 90

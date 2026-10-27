@@ -1,6 +1,10 @@
+import json
 import os
+import runpy
 import shlex
+import shutil
 import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -1296,3 +1300,602 @@ def test_mi450_sim_uses_stock_triton_compatible_libhip_path():
     assert 'libhip_path="${rocm_root}/lib/libamdhip64.so"' in script
     assert 'test -f "${libhip_path}"' in script
     assert 'export TRITON_LIBHIP_PATH="${libhip_path}"' in script
+
+
+def npu_step_script(workflow, job, name):
+    data = yaml.safe_load((REPO_ROOT / ".github/workflows" / workflow).read_text())
+    return next(s["run"] for s in data["jobs"][job]["steps"] if s.get("name") == name)
+
+
+@pytest.fixture
+def npu_source(tmp_path):
+    repo = tmp_path / "repository"
+    repo.mkdir()
+    real_git = shutil.which("git")
+
+    def git(*args):
+        return subprocess.check_output(
+            [real_git, "-C", str(repo), *args], text=True
+        ).strip()
+
+    git("init", "--quiet")
+    git("config", "user.name", "CI fixture")
+    git("config", "user.email", "fixture@example.invalid")
+    for name in ("ci/npu_ops_test/changes.py", ".github/scripts/ci_result_source.py"):
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPO_ROOT / name, path)
+    git("add", ".")
+    git("commit", "--quiet", "-m", "workflow reporter")
+    workflow = git("rev-parse", "HEAD")
+    reporter = repo / ".github/scripts/ci_result_source.py"
+    reporter.write_text(
+        reporter.read_text().replace(
+            "    actual = subprocess.run(",
+            "    raise RuntimeError('candidate reporter must not run')\n    actual = subprocess.run(",
+        )
+    )
+    git("add", ".")
+    git("commit", "--quiet", "-m", "candidate source")
+    candidate = git("rev-parse", "HEAD")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "fetch-calls"
+    waits = tmp_path / "waits"
+    wrapper = bin_dir / "git"
+    wrapper.write_text(f"#!{sys.executable}\n" + """
+import os, pathlib, sys
+args = sys.argv[1:]
+if 'fetch' in args:
+    calls = pathlib.Path(os.environ['FETCH_CALLS'])
+    count = int(calls.read_text()) + 1 if calls.exists() else 1
+    calls.write_text(str(count))
+    if count <= int(os.environ.get('FETCH_FAILURES', '0')):
+        print(f'network fixture failure {count}', file=sys.stderr)
+        sys.exit(int(os.environ.get('FETCH_STATUS', '128')))
+os.execv(os.environ['REAL_GIT'], [os.environ['REAL_GIT'], *args])
+""")
+    wrapper.chmod(0o755)
+    sleep = bin_dir / "sleep"
+    sleep.write_text(f"#!{sys.executable}\n" + """
+import os, pathlib, sys, time
+with pathlib.Path(os.environ['WAIT_CALLS']).open('a') as out:
+    out.write(sys.argv[1] + '\\n')
+if os.environ.get('REAL_RETRY_WAIT') == '1':
+    time.sleep(float(sys.argv[1]))
+""")
+    sleep.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "REAL_GIT": real_git,
+        "FETCH_CALLS": str(calls),
+        "WAIT_CALLS": str(waits),
+        "GITHUB_SERVER_URL": "https://github.com",
+        "GITHUB_REPOSITORY": "fixture/tokenspeed",
+        "NPU_SOURCE_SHA": candidate,
+        "NPU_SOURCE_DIR": str(tmp_path / "checkout"),
+        "NPU_WORKFLOW_SHA": candidate,
+        "GITHUB_ENV": str(tmp_path / "github-env"),
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": f"url.{repo.as_uri()}.insteadOf",
+        "GIT_CONFIG_VALUE_0": "https://github.com/fixture/tokenspeed.git",
+    }
+    return env, calls, waits, workflow, candidate
+
+
+@pytest.mark.parametrize("hardware", [False, True])
+@pytest.mark.parametrize(
+    "failures,status", [(0, 128), (3, 128), (4, 128), (1, 130), (1, 143)]
+)
+def test_checkout_retry_exhaustion_and_cancellation(
+    npu_source, hardware, failures, status, tmp_path
+):
+    env, calls, waits, workflow, candidate = npu_source
+    env.update(FETCH_FAILURES=str(failures), FETCH_STATUS=str(status))
+    if hardware:
+        env["NPU_REPORTER_DIR"] = str(tmp_path / "task")
+    script = npu_step_script(
+        "run-ci-task-matrix.yml" if hardware else "pr-test-ascendnpu-arm.yml",
+        "test" if hardware else "select",
+        "Prepare NPU source and reporter" if hardware else "Check out event commit",
+    )
+    result = subprocess.run(
+        ["bash", "-c", script], env=env, text=True, capture_output=True
+    )
+    exhausted = failures == 4
+    cancelled = status in (130, 143)
+    assert result.returncode == (status if exhausted or cancelled else 0), result.stderr
+    assert int(calls.read_text()) == (4 if failures >= 3 else 1)
+    actual_waits = waits.read_text().splitlines() if waits.exists() else []
+    assert actual_waits == (["30"] * (3 if failures >= 3 else 0))
+    if exhausted or cancelled:
+        assert not Path(env["GITHUB_ENV"]).exists()
+        assert "network fixture failure" in result.stderr
+    else:
+        assert (
+            subprocess.check_output(
+                [env["REAL_GIT"], "-C", env["NPU_SOURCE_DIR"], "rev-parse", "HEAD"],
+                text=True,
+            ).strip()
+            == candidate
+        )
+        assert (
+            subprocess.check_output(
+                [env["REAL_GIT"], "-C", env["NPU_SOURCE_DIR"], "status", "--porcelain"],
+                text=True,
+            )
+            == ""
+        )
+        if hardware:
+            assert "NPU_SOURCE_REPORTER=" in Path(env["GITHUB_ENV"]).read_text()
+
+
+def test_missing_workflow_commit_is_fetched_before_tests(npu_source, tmp_path):
+    env, calls, waits, workflow, candidate = npu_source
+    env.update(NPU_REPORTER_DIR=str(tmp_path / "task"), NPU_WORKFLOW_SHA=workflow)
+    script = npu_step_script(
+        "run-ci-task-matrix.yml", "test", "Prepare NPU source and reporter"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script], env=env, text=True, capture_output=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert int(calls.read_text()) == 2
+    assert (
+        "candidate reporter must not run"
+        not in (tmp_path / "task/source-reporter.py").read_text()
+    )
+    assert (
+        subprocess.check_output(
+            [env["REAL_GIT"], "-C", env["NPU_SOURCE_DIR"], "rev-parse", "HEAD"],
+            text=True,
+        ).strip()
+        == candidate
+    )
+
+
+def test_reporter_is_offline_pinned_and_rejects_tampering(npu_source, tmp_path):
+    env, calls, waits, workflow, candidate = npu_source
+    repo = Path(env["NPU_SOURCE_DIR"])
+    subprocess.run(
+        [env["REAL_GIT"], "clone", "--quiet", str(tmp_path / "repository"), str(repo)],
+        check=True,
+    )
+    subprocess.run(
+        [
+            env["REAL_GIT"],
+            "-C",
+            str(repo),
+            "remote",
+            "set-url",
+            "origin",
+            "https://offline.invalid/repo",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            str(repo / ".github/scripts/ci_result_source.py"),
+            "prepare",
+            "--repo",
+            str(repo),
+            "--workflow-sha",
+            workflow,
+            "--directory",
+            str(tmp_path / "task"),
+            "--github-env",
+            env["GITHUB_ENV"],
+        ],
+        env=env,
+        check=True,
+    )
+    # Recording must work without any repository retry or selection helper.
+    (repo / "ci/npu_ops_test/changes.py").unlink()
+    assert not calls.exists()
+    values = dict(
+        line.split("=", 1) for line in Path(env["GITHUB_ENV"]).read_text().splitlines()
+    )
+    env.update(
+        values,
+        WORK_DIR=str(repo),
+        EXPECTED_SOURCE=candidate,
+        CONFIG="test/ci/ut/ut-runtime-1npu.yaml",
+        RUNNER="ascend-npu-ops-test",
+    )
+    record = npu_step_script(
+        "run-ci-task-matrix.yml", "test", "Record NPU checked-out source"
+    )
+    result = subprocess.run(
+        ["bash", "-c", record], env=env, text=True, capture_output=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert (
+        json.loads((repo / ".ci-artifacts/source.json").read_text())["source_sha"]
+        == candidate
+    )
+    assert not calls.exists()
+    (repo / ".ci-artifacts/source.json").unlink()
+    env["EXPECTED_SOURCE"] = "0" * 40
+    mismatch = subprocess.run(
+        ["bash", "-c", record], env=env, text=True, capture_output=True
+    )
+    assert mismatch.returncode != 0
+    assert not (repo / ".ci-artifacts/source.json").exists()
+    reporter = Path(values["NPU_SOURCE_REPORTER"])
+    reporter.chmod(0o600)
+    reporter.write_text("raise RuntimeError('changed')\n")
+    changed = subprocess.run(
+        ["bash", "-c", record], env=env, text=True, capture_output=True
+    )
+    assert changed.returncode != 0
+    assert "Prepared source reporter was modified" in changed.stderr
+
+
+@pytest.mark.parametrize("status, proof_status", [(0, 0), (7, 0), (0, 7)])
+def test_runtime_install_entry_preserves_interpreter_arguments_and_status(
+    tmp_path, status, proof_status
+):
+    from pipeline import normalize_task
+
+    task = normalize_task(REPO_ROOT / "test/ci/ut/ut-runtime-1npu.yaml", REPO_ROOT)
+    interpreter = tmp_path / "bootstrap python"
+    arguments = tmp_path / "arguments.json"
+    interpreter.write_text(
+        f"#!{sys.executable}\n"
+        + f"import json, pathlib, sys\npathlib.Path({str(arguments)!r}).write_text(json.dumps(sys.argv[1:]))\nsys.exit({status})\n"
+    )
+    interpreter.chmod(0o755)
+    proof_python = tmp_path / "model-venv/bin/python"
+    proof_python.parent.mkdir(parents=True)
+    proof_python.write_text(
+        f"#!{sys.executable}\nimport sys\nsys.exit({proof_status})\n"
+    )
+    proof_python.chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-c", task["install"][0]],
+        env=dict(
+            os.environ,
+            NPU_CI_BOOTSTRAP_PYTHON=str(interpreter),
+            NPU_CI_WORK=str(tmp_path),
+            CI_RUNNER_LABEL="ascend-npu-ops-test",
+            NPU_CI_RUNTIME="true",
+        ),
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode == (status or proof_status)
+    assert json.loads(arguments.read_text()) == ["-B", "-"]
+
+
+def npu_installer_functions():
+    source = (REPO_ROOT / "test/ci_system/install_deps.sh").read_text()
+    script = source.split("<<'NPU_INSTALL'\n", 1)[1].split("\nNPU_INSTALL", 1)[0]
+    namespace = {"__name__": "npu_installer_test"}
+    exec(compile(script, "install_deps.sh:NPU_INSTALL", "exec"), namespace)
+    return namespace
+
+
+def write_npu_wheel_manifest(directory):
+    import hashlib
+
+    files = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in directory.glob("*.whl")
+    }
+    manifest = directory / "manifest.json"
+    manifest.write_text(json.dumps({"schema_version": 1, "files": files}))
+    manifest.chmod(0o644)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["content", "extra", "symlink", "writable-file", "writable-directory", "owner"],
+)
+def test_npu_wheelhouse_rejects_untrusted_changes(tmp_path, damage):
+    wheel = tmp_path / "fixture-1-py3-none-any.whl"
+    wheel.write_bytes(b"verified fixture")
+    wheel.chmod(0o644)
+    tmp_path.chmod(0o755)
+    write_npu_wheel_manifest(tmp_path)
+    verify = npu_installer_functions()["verify_wheelhouse"]
+    result = verify(tmp_path, owner_uid=os.getuid())
+    assert result["wheel_count"] == 1
+    if damage == "content":
+        wheel.write_bytes(b"changed")
+    elif damage == "extra":
+        (tmp_path / "extra-1-py3-none-any.whl").write_bytes(b"extra")
+    elif damage == "symlink":
+        data = wheel.read_bytes()
+        wheel.unlink()
+        target = tmp_path.parent / "outside.whl"
+        target.write_bytes(data)
+        wheel.symlink_to(target)
+    elif damage == "writable-file":
+        wheel.chmod(0o666)
+    elif damage == "writable-directory":
+        tmp_path.chmod(0o777)
+    owner = os.getuid() + 1 if damage == "owner" else os.getuid()
+    with pytest.raises(ValueError):
+        verify(tmp_path, owner_uid=owner)
+
+
+@pytest.mark.parametrize("missing_dependency", [False, True])
+def test_npu_dependency_install_uses_wheels_without_index(
+    tmp_path, monkeypatch, missing_dependency
+):
+    import threading
+    import venv
+    import zipfile
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    requests = []
+
+    class Index(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append(self.path)
+            self.send_error(503)
+
+        def log_message(self, *args):
+            pass
+
+    wheelhouse = tmp_path / "wheels"
+    wheelhouse.mkdir(mode=0o755)
+    name = "npu_ci_offline_fixture"
+    info = f"{name}-1.0.dist-info"
+    files = {
+        f"{name}.py": "VALUE = 42\n",
+        f"{info}/METADATA": (
+            "Metadata-Version: 2.1\nName: npu-ci-offline-fixture\nVersion: 1.0\n"
+            + (
+                "Requires-Dist: npu-ci-missing-dependency>=1\n"
+                if missing_dependency
+                else ""
+            )
+        ),
+        f"{info}/WHEEL": "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+    }
+    files[f"{info}/RECORD"] = (
+        "".join(f"{path},,\n" for path in files) + f"{info}/RECORD,,\n"
+    )
+    wheel = wheelhouse / f"{name}-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for path, content in files.items():
+            archive.writestr(path, content)
+    wheel.chmod(0o644)
+    write_npu_wheel_manifest(wheelhouse)
+    installer = npu_installer_functions()
+    installer["verify_wheelhouse"](wheelhouse, owner_uid=os.getuid())
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=True).create(environment)
+    python = str(environment / "bin/python")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Index)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("PIP_CONFIG_FILE", os.devnull)
+    monkeypatch.setenv("PIP_INDEX_URL", f"http://127.0.0.1:{server.server_port}/simple")
+    monkeypatch.setenv(
+        "PIP_EXTRA_INDEX_URL", f"http://127.0.0.1:{server.server_port}/extra"
+    )
+    for key in ("PIP_NO_INDEX", "PIP_FIND_LINKS", "PIP_CONSTRAINT"):
+        monkeypatch.delenv(key, raising=False)
+    try:
+
+        def install():
+            installer["install_from_wheelhouse"](
+                python,
+                wheelhouse,
+                ["npu-ci-offline-fixture==1.0"],
+                options=["--only-binary=:all:", "--disable-pip-version-check"],
+            )
+
+        if missing_dependency:
+            with pytest.raises(subprocess.CalledProcessError):
+                install()
+        else:
+            install()
+            output = subprocess.check_output(
+                [python, "-c", f"import {name}; print({name}.VALUE)"], text=True
+            )
+            assert output.strip() == "42"
+            subprocess.run([python, "-m", "pip", "check"], check=True)
+        assert requests == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.parametrize(
+    "allowed_names,runner_name,accepted",
+    [
+        ("npu-one", "npu-one", True),
+        ("npu-one\nnpu-two", "npu-two", True),
+        ("\nnpu-one\r\n\nnpu-two\r\n", "npu-one", True),
+        ("", "npu-one", False),
+        ("npu-one\nnpu-two", "npu-other", False),
+        ("npu-one-more", "npu-one", False),
+        ("npu-*", "npu-one", False),
+        ("npu-one", "", False),
+    ],
+)
+def test_npu_runner_allowlist_checks_exact_names(allowed_names, runner_name, accepted):
+    script = npu_step_script(
+        "run-ci-task-matrix.yml", "test", "Check NPU runner environment"
+    )
+    # Stop at the next real guard, before Linux/ARM checks or filesystem changes.
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env={
+            **os.environ,
+            "NPU_RUNNER_NAMES": allowed_names,
+            "RUNNER_NAME": runner_name,
+            "GITHUB_SERVER_URL": "https://unsupported.invalid",
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 1
+    if accepted:
+        assert "Unsupported GitHub server" in result.stderr
+        assert "NPU runner name does not match" not in result.stderr
+    else:
+        assert "NPU runner name does not match the deployment" in result.stderr
+        assert "Unsupported GitHub server" not in result.stderr
+
+
+def test_npu_pool_schedules_each_suite_once():
+    matrix = build_matrix(
+        REPO_ROOT / "test/ci", REPO_ROOT, "per-commit", "npu", "unit-test"
+    )
+    assert Counter(entry["name"] for entry in matrix["include"]) == {
+        "npu-operators": 1,
+        "ut-runtime-1npu": 1,
+    }
+    assert {entry["runner"] for entry in matrix["include"]} == {"ascend-npu-ops-test"}
+
+
+def test_k8s_dispatch_does_not_schedule_npu_tasks(tmp_path):
+    workflow = load_yaml(REPO_ROOT / ".github/workflows/k8s-dispatch.yml")
+    step = next(
+        step
+        for step in workflow["jobs"]["scan"]["steps"]
+        if step.get("name") == "Build task matrix"
+    )
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "YAML_SELECTION": "all",
+            "TASK_TYPES": "ut",
+            "RUNNER_POOL": "all",
+            "EXACT_RUNNER": "",
+            "MATCH": "",
+            "TRIGGER": "per-commit",
+            "INCLUDE_MMLU": "false",
+            "GITHUB_OUTPUT": str(output),
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    entries = json.loads(values["matrix"])["include"]
+    assert entries
+    assert all(entry["runner"] != "ascend-npu-ops-test" for entry in entries)
+    assert not {"npu-operators", "ut-runtime-1npu"}.intersection(
+        entry["name"] for entry in entries
+    )
+
+
+def test_ascend_cleanup_removes_only_its_job_directory(tmp_path):
+    work = tmp_path / "current-job"
+    checkout = work / "checkout"
+    checkout.mkdir(parents=True)
+    (work / "evidence").write_text("current job")
+    other = tmp_path / "another-job"
+    other.mkdir()
+    (other / "evidence").write_text("preserve")
+    script = npu_step_script("run-ci-task-matrix.yml", "test", "Cleanup work directory")
+    script = script.replace("${{ matrix.runner }}", "ascend-npu-ops-test")
+    script = script.replace("${{ env.WORK_DIR }}", str(checkout))
+    subprocess.run(
+        ["bash", "-c", script], env={**os.environ, "NPU_CI_WORK": str(work)}, check=True
+    )
+    assert not work.exists()
+    assert (other / "evidence").read_text() == "preserve"
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "content",
+        "extra",
+        "symlink",
+        "writable-file",
+        "writable-directory",
+        "owner",
+        "source-lock",
+    ],
+)
+def test_engine_build_inputs_require_exact_protected_sources(tmp_path, damage):
+    import hashlib
+
+    bundle = tmp_path / "dependencies"
+    source = tmp_path / "checkout"
+    bundle.mkdir()
+    files = {
+        "vendor/fixture/lib.rs": b"immutable dependency",
+        "rust/bin/rustc": b"compiler",
+    }
+    for name, data in files.items():
+        path = bundle / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        path.chmod(0o644)
+    lock = source / "tokenspeed-engine/Cargo.lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_bytes(b"locked source dependencies")
+    grammar = lock.parent / "crates/ts-grammar/CMakeLists.txt"
+    grammar.parent.mkdir(parents=True)
+    grammar.write_bytes(b"pinned grammar source")
+    manifest = {
+        "schema_version": 1,
+        "files": {
+            name: hashlib.sha256(data).hexdigest() for name, data in files.items()
+        },
+        "cargo_lock_sha256": hashlib.sha256(lock.read_bytes()).hexdigest(),
+        "xgrammar_build_sha256": hashlib.sha256(grammar.read_bytes()).hexdigest(),
+        "rust_version": "fixture version",
+    }
+    (bundle / "manifest.json").write_text(json.dumps(manifest))
+    verify = npu_installer_functions()["verify_engine_dependencies"]
+    assert verify(bundle, source, owner_uid=os.getuid())["file_count"] == 2
+    path = bundle / "vendor/fixture/lib.rs"
+    if damage == "content":
+        path.write_bytes(b"unexpected change")
+    elif damage == "extra":
+        (bundle / "extra").write_text("unexpected input")
+    elif damage == "symlink":
+        target = tmp_path / "outside"
+        target.write_bytes(path.read_bytes())
+        path.unlink()
+        path.symlink_to(target)
+    elif damage == "writable-file":
+        path.chmod(0o666)
+    elif damage == "writable-directory":
+        path.parent.chmod(0o777)
+    elif damage == "source-lock":
+        lock.write_bytes(b"new dependency not yet provisioned")
+    owner = os.getuid() + 1 if damage == "owner" else os.getuid()
+    with pytest.raises(ValueError):
+        verify(bundle, source, owner_uid=owner)
+
+
+@pytest.mark.parametrize("damage", [None, "content", "outside"])
+def test_engine_binary_identity_requires_job_local_unchanged_files(tmp_path, damage):
+    import hashlib
+
+    prefix = tmp_path / "venv"
+    prefix.mkdir()
+    binary = prefix / "ts-host"
+    binary.write_bytes(b"recorded engine binary")
+    evidence = {
+        "path": str(binary),
+        "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+    }
+    check = runpy.run_path(
+        str(REPO_ROOT / "test/runtime/models/test_qwen3_npu_smoke.py")
+    )["check_runtime_binary"]
+    if damage == "content":
+        binary.write_bytes(b"unexpected binary")
+    elif damage == "outside":
+        binary.rename(tmp_path / "outside-engine")
+        binary.symlink_to(tmp_path / "outside-engine")
+    if damage:
+        with pytest.raises(ValueError):
+            check(evidence, prefix)
+    else:
+        check(evidence, prefix)

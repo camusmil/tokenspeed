@@ -26,8 +26,52 @@ import argparse
 import json
 import re
 import subprocess
+import sys
+import time
 from fnmatch import fnmatchcase
 from pathlib import Path
+
+
+def run_github(command, *, cwd, timeout_seconds, capture_output):
+    for attempt in range(1, 5):
+        try:
+            return subprocess.run(
+                command,
+                cwd=cwd,
+                timeout=timeout_seconds,
+                capture_output=capture_output,
+                text=True,
+                check=True,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            if isinstance(exc, subprocess.CalledProcessError) and exc.returncode in (
+                -2,
+                -15,
+                130,
+                143,
+            ):
+                raise
+            error = exc.stderr
+            if error:
+                print(
+                    (
+                        error.decode(errors="replace")
+                        if isinstance(error, bytes)
+                        else error
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+            print(
+                f"GitHub read attempt {attempt}/4 failed: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if attempt == 4:
+                raise
+            print("Retrying GitHub read in 30 seconds", file=sys.stderr, flush=True)
+            time.sleep(30)
+    raise AssertionError("Unreachable retry state")
 
 
 def load_manifest(path: Path) -> dict:
@@ -102,13 +146,52 @@ def select_suite(manifest: dict, event_name: str, paths: set[str]) -> dict:
     }
 
 
+def select_model_suite(event_name: str, paths: set[str]) -> dict:
+    model_paths = (
+        "ci/npu_ops_test/changes.py",
+        ".github/scripts/ci_result_source.py",
+        "python/**",
+        "tokenspeed-scheduler/**",
+        "tokenspeed-engine/**",
+        "tokenspeed-kernel/python/**",
+        "tokenspeed-kernel-npu/**",
+        "test/runtime/models/test_qwen3_npu_smoke.py",
+        "test/runtime/run_ci_suite.py",
+        "test/ci/ut/ut-runtime-1npu.yaml",
+        "test/ci_system/ci_register.py",
+        "test/ci_system/ci_utils.py",
+        "test/ci_system/pipeline.py",
+        "test/ci_system/process_group_manager.py",
+        "test/ci_system/install_deps.sh",
+        "test/ci_system/test_pipeline.py",
+        "test/ci_system/test_process_group_manager.py",
+        "test/ci_system/test_dispatch_workflows.py",
+        ".github/workflows/pr-test-ascendnpu-arm.yml",
+        ".github/workflows/run-ci-task-matrix.yml",
+    )
+    matched = sorted(
+        path
+        for path in paths
+        if not path.lower().endswith((".md", ".rst"))
+        and any(fnmatchcase(path, pattern) for pattern in model_paths)
+    )
+    selected = event_name == "workflow_dispatch" or bool(matched)
+    return {
+        "should_run": selected,
+        "matched_paths": matched,
+        "reason": (
+            "manual"
+            if event_name == "workflow_dispatch"
+            else ("watched-path-changed" if selected else "no-watched-changes")
+        ),
+    }
+
+
 def github_json(endpoint, *, paginate):
     command = ["gh", "api", endpoint]
     if paginate:
         command += ["--paginate", "--slurp"]
-    result = subprocess.run(
-        command, check=True, capture_output=True, text=True, timeout=120
-    )
+    result = run_github(command, cwd=None, timeout_seconds=120, capture_output=True)
     return json.loads(result.stdout)
 
 
@@ -206,10 +289,13 @@ def main() -> int:
             raise ValueError("Event payload must be an object")
         paths = changed_paths(args.repository, args.event_name, event)
         result = select_suite(manifest, args.event_name, paths)
+        model = select_model_suite(args.event_name, paths)
+        result["model"] = model
         if args.github_output is not None:
             with args.github_output.open("a", encoding="utf-8") as output:
                 output.write(f"should_run={str(result['should_run']).lower()}\n")
                 output.write(f"reason={result['reason']}\n")
+                output.write(f"model_should_run={str(model['should_run']).lower()}\n")
         print(json.dumps(result, indent=2))
         return 0
     except (

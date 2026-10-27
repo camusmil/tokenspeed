@@ -4,7 +4,7 @@ Process-group-based process lifecycle manager for CI runners.
 Usage
 -----
 # At job start (cleans up stale processes from previous run):
-mgr = ProcessGroupManager(runner_id="gb200-node-1")
+mgr = ProcessGroupManager(runner_id="gb200-node-1", supervision=None)
 mgr.cleanup_stale()
 
 # Launch a long-running server:
@@ -16,11 +16,16 @@ mgr.terminate_all()
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import select
+import selectors
 import signal
 import subprocess
+import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -80,10 +85,45 @@ def _kill_pgid(pgid: int, sig: signal.Signals) -> None:
         pass
 
 
+@dataclass(frozen=True)
+class CommandSupervision:
+    """Explicit lock, deadlines and ownership for synchronous Linux commands."""
+
+    log_directory: Path
+    stage_key: str
+    timeouts: dict[str, int]
+    lock_path: Path
+    lock_wait: int
+    source_sha: str
+    owner_pid: str | None
+    owner_start: str | None
+
+    def __post_init__(self):
+        if (
+            self.lock_wait <= 0
+            or not self.timeouts
+            or any(t <= 0 for t in self.timeouts.values())
+        ):
+            raise ValueError("Command timeouts must be positive")
+        if any(
+            re.fullmatch(r"[A-Za-z0-9_-]+", stage) is None for stage in self.timeouts
+        ):
+            raise ValueError("Invalid command stage")
+        if (self.owner_pid is None) != (self.owner_start is None):
+            raise ValueError("Owner PID and start time must be supplied together")
+
+
 class ProcessGroupManager:
-    def __init__(self, runner_id: str, term_timeout: float = 10.0) -> None:
+    def __init__(
+        self,
+        runner_id: str,
+        term_timeout: float = 10.0,
+        *,
+        supervision: CommandSupervision | None,
+    ) -> None:
         if not runner_id:
             raise ValueError("runner_id must be a non-empty string")
+        self.supervision = supervision
         self.runner_id = runner_id
         self.term_timeout = term_timeout
         self._procs: list[subprocess.Popen] = []
@@ -93,6 +133,8 @@ class ProcessGroupManager:
         Kill any process group left over from a previous run of this runner.
         Safe to call even if no stale pgid file exists.
         """
+        if self.supervision is not None:
+            raise ValueError("Supervised commands cannot clean up other runner jobs")
         pgids = _load_pgids(self.runner_id)
         if not pgids:
             print(
@@ -146,6 +188,8 @@ class ProcessGroupManager:
         dry_run: bool = False,
     ) -> Optional[subprocess.Popen]:
         """Launch command in a new process group (long-running server)."""
+        if self.supervision is not None:
+            raise ValueError("Supervised commands must use synchronous run()")
         print(f"[pgm] start: launching command for runner={self.runner_id}", flush=True)
         print(f"$ {command}", flush=True)
         if dry_run:
@@ -198,6 +242,16 @@ class ProcessGroupManager:
         if dry_run:
             print("[pgm] run: [dry-run] skip", flush=True)
             return {"command": command, "returncode": 0, "output": "", "dry_run": True}
+
+        if self.supervision is not None:
+            if not shell or env is None or cwd is None:
+                raise ValueError("Supervised commands require shell=True, env and cwd")
+            result = _run_supervised(command, env=env, cwd=cwd, policy=self.supervision)
+            if check and result["returncode"] != 0:
+                raise RuntimeError(
+                    f"command failed with exit code {result['returncode']}: {command}"
+                )
+            return result
 
         proc = subprocess.Popen(
             command,
@@ -273,6 +327,10 @@ class ProcessGroupManager:
 
     def terminate_all(self, dry_run: bool = False) -> None:
         """Kill all processes started via this manager."""
+        if self.supervision is not None:
+            # run() waits for its independent supervisor to clean up while holding
+            # the lock. Never consult a persistent ledger owned by another job.
+            return
         print(
             f"[pgm] terminate_all: runner={self.runner_id} tracked_procs={len(self._procs)}",
             flush=True,
@@ -397,15 +455,235 @@ def make_manager(term_timeout: float = 10.0) -> ProcessGroupManager:
         f"HOSTNAME={os.environ.get('HOSTNAME', '<unset>')})",
         flush=True,
     )
-    return ProcessGroupManager(runner_id=runner_id, term_timeout=term_timeout)
+    return ProcessGroupManager(
+        runner_id=runner_id, term_timeout=term_timeout, supervision=None
+    )
 
 
-if __name__ == "__main__":
+def _write_json(path, value):
+    with Path(path).open("w") as handle:
+        json.dump(value, handle, indent=2, allow_nan=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _process_start(pid):
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+    except FileNotFoundError:
+        return None
+
+
+def _supervise(args):
+    """Keep the private command group and host lock until all cleanup completes."""
+    import fcntl
+
+    interrupted = []
+    for number in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(number, lambda number, frame: interrupted.append(number))
+    started = time.monotonic()
+    process = None
+    rc = 1
+    reason = None
+    lock = None
+    worker = args.owner_pid
+
+    def owner_gone():
+        ready, _, _ = select.select([args.parent_fd], [], [], 0)
+        return (ready and not os.read(args.parent_fd, 1)) or (
+            worker is not None and _process_start(int(worker)) != args.owner_start
+        )
+
+    try:
+        lock = open(args.lock, "r+")
+        while True:
+            if interrupted or owner_gone():
+                raise InterruptedError(
+                    "Command owner exited while waiting for host lock"
+                )
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() - started >= args.lock_wait:
+                    raise TimeoutError("Host lock wait timed out")
+                time.sleep(0.1)
+        deadline = time.monotonic() + args.timeout
+        process = subprocess.Popen(
+            ["bash", "-c", args.command],
+            cwd=args.cwd,
+            start_new_session=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        with args.log.open("xb") as log, selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                if interrupted or owner_gone():
+                    reason = "Command owner exited or was interrupted"
+                    rc = 128 + (interrupted[0] if interrupted else signal.SIGTERM)
+                    break
+                if time.monotonic() >= deadline:
+                    reason, rc = "Command execution timed out", 124
+                    break
+                for key, _ in selector.select(0.1):
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    log.write(chunk)
+                    log.flush()
+                    try:
+                        sys.stdout.buffer.write(chunk)
+                        sys.stdout.buffer.flush()
+                    except BrokenPipeError:
+                        pass
+                if (
+                    os.waitid(
+                        os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
+                    )
+                    is not None
+                ):
+                    rc = 0
+                    break
+            log.flush()
+            os.fsync(log.fileno())
+    except BaseException as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        rc = 1
+    finally:
+        try:
+            if process is not None:
+                # Preserve the group leader PID until its remaining descendants stop.
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    time.sleep(0.5)
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=5)
+                process.stdout.close()
+                if rc == 0:
+                    rc = (
+                        process.returncode
+                        if process.returncode >= 0
+                        else 128 - process.returncode
+                    )
+            _write_json(
+                args.log.with_suffix(".process.json"),
+                {
+                    "exit_code": rc,
+                    "reason": reason,
+                    "source_sha": args.source_sha,
+                    "child_pid": process.pid if process else None,
+                },
+            )
+        finally:
+            if lock is not None:
+                lock.close()
+            os.close(args.parent_fd)
+    return rc
+
+
+def _run_supervised(command, *, env, cwd, policy):
+    stage = env[policy.stage_key]
+    if stage not in policy.timeouts:
+        raise ValueError(f"Unsupported command stage: {stage}")
+    log = policy.log_directory / f"{stage}.log"
+    timeout = str(policy.timeouts[stage])
+    read_fd, write_fd = os.pipe()
+    process = None
+    output = []
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-B",
+                str(Path(__file__).resolve()),
+                "supervise",
+                "--parent-fd",
+                str(read_fd),
+                "--timeout",
+                timeout,
+                "--lock-wait",
+                str(policy.lock_wait),
+                "--lock",
+                str(policy.lock_path),
+                "--source-sha",
+                policy.source_sha,
+                *(
+                    [
+                        "--owner-pid",
+                        policy.owner_pid,
+                        "--owner-start",
+                        policy.owner_start,
+                    ]
+                    if policy.owner_pid is not None
+                    else []
+                ),
+                "--cwd",
+                str(cwd),
+                "--log",
+                str(log),
+                "--command",
+                command,
+            ],
+            pass_fds=(read_fd,),
+            start_new_session=True,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+        )
+        os.close(read_fd)
+        read_fd = None
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            output.append(line)
+        rc = process.wait()
+        proof = json.loads(log.with_suffix(".process.json").read_text())
+        if proof["exit_code"] != rc or proof["source_sha"] != policy.source_sha:
+            raise RuntimeError("Command process evidence mismatch")
+        return {"command": command, "returncode": rc, "output": "".join(output)}
+    finally:
+        if read_fd is not None:
+            os.close(read_fd)
+        os.close(write_fd)
+        if process is not None:
+            process.stdout.close()
+            process.wait(timeout=20)
+
+
+def main():
     import argparse
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["cleanup-stale"])
+    modes = parser.add_subparsers(dest="mode", required=True)
+    modes.add_parser("cleanup-stale")
+    child = modes.add_parser("supervise")
+    child.add_argument("--parent-fd", type=int, required=True)
+    child.add_argument("--timeout", type=int, required=True)
+    child.add_argument("--lock-wait", type=int, required=True)
+    child.add_argument("--lock", type=Path, required=True)
+    child.add_argument("--source-sha", required=True)
+    child.add_argument("--owner-pid")
+    child.add_argument("--owner-start")
+    child.add_argument("--cwd", type=Path, required=True)
+    child.add_argument("--log", type=Path, required=True)
+    child.add_argument("--command", required=True)
     args = parser.parse_args()
-    if args.command == "cleanup-stale":
-        # Survivors of cancelled/timed-out jobs hold WORK_DIR files open, so rm -rf fails on NFS.
+    if args.mode == "cleanup-stale":
+        # Survivors can hold work directory files open on NFS.
         make_manager().cleanup_stale()
+        return 0
+    if args.timeout <= 0 or args.lock_wait <= 0:
+        parser.error("Command timeouts must be positive")
+    if (args.owner_pid is None) != (args.owner_start is None):
+        parser.error("Owner PID and start time must be supplied together")
+    return _supervise(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

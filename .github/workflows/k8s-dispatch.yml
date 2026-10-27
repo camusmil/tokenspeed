@@ -42,6 +42,7 @@ on:
           - test/ci/eval/minimax-m3-nvfp4-dspark-evalscope-aime26.yaml
           - test/ci/eval/minimax-m3-nvfp4-evalscope-aime25.yaml
           - test/ci/eval/muse-spark-mxfp4-tp4ep4-evalscope-aime26-amd.yaml
+          - test/ci/eval/muse-spark-mxfp4-tp8ep1-evalscope-aime26-amd.yaml
           - test/ci/eval/muse-spark-mxfp4-tp8ep8-evalscope-aime26-amd.yaml
           - test/ci/eval/qwen3.5-122b-a10b-nvfp4-epd-1e1p2d-evalscope-ocr-bench.yaml
           - test/ci/eval/qwen3.5-122b-a10b-nvfp4-evalscope-ocr-bench.yaml
@@ -254,7 +255,7 @@ jobs:
 
           repo = Path.cwd()
           sys.path.insert(0, str(repo / "test/ci_system"))
-          from pipeline import build_matrix
+          from pipeline import build_matrix, is_npu_runner
 
           def terms(name):
               return [item.strip() for item in os.environ[name].split(",") if item.strip()]
@@ -285,7 +286,7 @@ jobs:
           for task in matrix["include"]:
               searchable = f"{task['name']} {task['config']}".lower()
               runner = task["runner"]
-              if runner.startswith("slurm-") or runner == "tokenspeed-npu-arm64":
+              if runner.startswith("slurm-") or is_npu_runner(runner):
                   continue
               if os.environ["EXACT_RUNNER"] and runner != os.environ["EXACT_RUNNER"]:
                   continue
