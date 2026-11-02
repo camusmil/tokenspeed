@@ -61,8 +61,6 @@ dependencies = [
     "pybind11",
     "pydantic",
     "py-spy",
-    "pytest>=9",
-    "pytest-asyncio",
     "python-multipart",
     "pyzmq",
     "requests",
@@ -98,6 +96,9 @@ ts = "tokenspeed.cli:main"
 "Homepage" = "https://github.com/lightseekorg/tokenspeed"
 
 [project.optional-dependencies]
+# Test runners are separate from inference dependencies. Native compiler stacks
+# may require a different pytest version; GPU CI explicitly requests this extra.
+test = ["pytest>=9", "pytest-asyncio"]
 # Capped: 0.1.9 clones internally, so a release that stops would alias silently.
 instanttensor = ["instanttensor>=0.1.9,<0.2"]
 

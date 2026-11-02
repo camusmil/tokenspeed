@@ -28,3 +28,11 @@ independent reaper handles cancellation and expired Runner leases by owned UID.
 Validation PRs target the isolated `codex/cp12-k3s-20261102` branch. They do not
 merge into main or switch upstream hardware CI. Public evidence excludes host
 addresses, credentials, and private deployment details.
+
+Test tools are declared in the vendor-neutral `test` extra. NVIDIA CUDA and AMD
+CI installers explicitly install `python[test]`, preserving their pytest>=9 and
+pytest-asyncio requirements. Native NPU inference installs the runtime package
+without that extra, allowing Triton Ascend 3.2.1 to retain its declared
+pytest==8.3.2 dependency. No dependency metadata is overridden, and `pip check`
+remains mandatory. Developers running the shared test suite should also request
+the `test` extra.
