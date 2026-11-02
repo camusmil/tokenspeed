@@ -39,6 +39,8 @@ def main():
     output = Path(a.output)
     root = Path(a.root)
     profile = json.loads((Path(__file__).parent / "model-profile.json").read_text())
+    if profile["topology"]["nodes"] != 1:
+        raise ValueError("This registered profile requires one node")
     args = qwen_smoke.parse_args(
         [
             "--source-root",
@@ -56,21 +58,21 @@ def main():
             "--manifest-sha256",
             a.manifest_sha,
             "--dtype",
-            "bfloat16",
+            profile["dtype"],
             "--sampling-backend",
             "greedy",
             "--temperature",
             "0.0",
             "--device",
-            "npu",
+            profile["device"],
             "--device-count",
-            "1",
+            str(profile["topology"]["devices"]),
             "--tp-size",
-            "1",
+            str(profile["topology"]["tp"]),
             "--dp-size",
-            "1",
+            str(profile["topology"]["dp"]),
             "--pp-size",
-            "1",
+            str(profile["topology"]["pp"]),
             "--prompt",
             profile["prompt"],
             "--max-new-tokens",
@@ -93,18 +95,19 @@ def main():
         except ValueError as e:
             result.update(status="failed", injected_failure=str(e))
             rc = 43
-    gate = {
-        "stage": a.stage,
-        "execution_status": result["status"],
-        "quality_verdict": "not_evaluated",
-        "performance_verdict": "not_evaluated",
-        "baseline": None,
-        "reason": "No frozen quality/performance baseline; bounded native smoke only",
-        "elapsed_seconds": elapsed,
-        "output_tokens": len(result.get("output_ids", [])),
-    }
-    if rc == 0:
-        gate["end_to_end_tokens_per_second"] = gate["output_tokens"] / elapsed
+    from gates import evaluate
+
+    try:
+        gate = evaluate(profile, result, a.stage, elapsed)
+    except ValueError as exc:
+        gate = {
+            "stage": a.stage,
+            "execution_status": result["status"],
+            "gate_error": str(exc),
+            "quality_verdict": "not_evaluated",
+            "performance_verdict": "not_evaluated",
+        }
+        rc = rc or 44
     (output / "gate.json").write_text(json.dumps(gate, indent=2) + "\n")
     (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return rc

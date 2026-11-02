@@ -59,11 +59,61 @@ class ChainContractTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 api["load_inputs"](target)
 
-    def test_model_missing_baselines_are_explicit(self):
+    def test_model_baselines_fail_closed_and_remain_explicit(self):
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).parent))
+        from gates import evaluate
+
         profile = json.loads((Path(__file__).parent / "model-profile.json").read_text())
-        self.assertIsNone(profile["quality_baseline"])
-        self.assertIsNone(profile["performance_baseline"])
-        self.assertEqual(profile["missing_baseline_policy"], "not_evaluated")
+        result = {"status": "passed", "output_ids": [1, 2]}
+        self.assertEqual(
+            evaluate(profile, result, "model-accuracy", 2)["quality_verdict"],
+            "not_evaluated",
+        )
+        self.assertEqual(
+            evaluate(profile, result, "model-performance", 2)[
+                "end_to_end_tokens_per_second"
+            ],
+            1,
+        )
+        with self.assertRaises(ValueError):
+            evaluate(
+                dict(profile, missing_baseline_policy="block"),
+                result,
+                "model-accuracy",
+                2,
+            )
+        self.assertEqual(
+            evaluate(
+                dict(profile, quality_baseline={"expected_output_ids": [1, 2]}),
+                result,
+                "model-accuracy",
+                2,
+            )["quality_verdict"],
+            "passed",
+        )
+        with self.assertRaises(ValueError):
+            evaluate(
+                dict(profile, quality_baseline={"expected_output_ids": [3]}),
+                result,
+                "model-accuracy",
+                2,
+            )
+        with self.assertRaises(ValueError):
+            evaluate(
+                dict(
+                    profile,
+                    performance_baseline={"minimum_end_to_end_tokens_per_second": 2},
+                ),
+                result,
+                "model-performance",
+                2,
+            )
+        with self.assertRaises(ValueError):
+            evaluate(
+                profile, {"status": "failed", "output_ids": [1]}, "model-accuracy", 1
+            )
 
 
 if __name__ == "__main__":
