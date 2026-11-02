@@ -28,3 +28,5 @@ independent reaper handles cancellation and expired Runner leases by owned UID.
 Validation PRs target the isolated `codex/cp12-k3s-20261102` branch. They do not
 merge into main or switch upstream hardware CI. Public evidence excludes host
 addresses, credentials, and private deployment details.
+
+Documentation-only updates are expected to skip the registered hardware chain.
