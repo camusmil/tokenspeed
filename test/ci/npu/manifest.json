@@ -10,7 +10,8 @@
     ".github/workflows/run-ci-task-matrix.yml",
     "test/ci_system/*ascend*",
     "test/ci/ut/npu-operators.yaml",
-    "test/ci_system/pipeline.py"
+    "test/ci_system/pipeline.py",
+    ".github/workflows/cp12-k3s.yml"
   ],
   "expected_plans": "test/ci/npu/expected-plans.json",
   "execution": {
