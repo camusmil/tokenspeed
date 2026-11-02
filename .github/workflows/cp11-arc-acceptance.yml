@@ -1,0 +1,47 @@
+name: CP11 ARC lifecycle acceptance
+
+on:
+  push:
+    branches: [codex/cp11-arc-20261102]
+    paths: [.github/workflows/cp11-arc-acceptance.yml]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: cp11-arc-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: registered NPU lifecycle and durable results
+    runs-on: tokenspeed-pr-arm64
+    timeout-minutes: 20
+    steps:
+      - name: Check orchestration Runner boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = aarch64
+          test "$(id -u)" != 0
+          test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token
+          test ! -e /var/run/docker.sock
+          test ! -e /dev/davinci0
+          test -x /home/runner/externals/node24/bin/node
+          printf 'ARM64 orchestration Runner; no NPU, kube token or Docker socket\n'
+      - name: Single and gang lifecycle acceptance
+        run: /home/runner/externals/node24/bin/node /opt/cp11/client.js suite
+      - name: Durable task across execution-service restart
+        run: /home/runner/externals/node24/bin/node /opt/cp11/client.js restart
+      - name: Save lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cp11-lifecycle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: cp11-results/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Leave controlled worker for independent lease cleanup after Runner exit
+        if: success()
+        run: /home/runner/externals/node24/bin/node /opt/cp11/client.js orphan
