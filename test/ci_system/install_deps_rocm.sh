@@ -85,7 +85,7 @@ echo "=== Step 6: Install TokenSpeed ==="
 # tokenspeed-smg / -grpc-servicer / -grpc-proto are pinned in
 # python/pyproject.toml; pip resolves them from PyPI as part of the
 # editable install below.
-pip_install_with_retry pip3 install -e ./python --no-build-isolation
+pip_install_with_retry pip3 install -e "./python[test]" --no-build-isolation
 
 echo ""
 echo "=========================================="

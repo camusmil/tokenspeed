@@ -1,0 +1,73 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+name: Run NPU K3s Task Matrix
+
+"on":
+  workflow_call:
+    inputs:
+      matrix:
+        required: true
+        type: string
+      prerequisite_task_id:
+        required: true
+        type: string
+      prerequisite_receipt_sha256:
+        required: true
+        type: string
+    outputs:
+      task_id:
+        value: ${{ jobs.test.outputs.task_id }}
+      result_sha256:
+        value: ${{ jobs.test.outputs.result_sha256 }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(inputs.matrix) }}
+    name: ${{ matrix.name }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 125
+    outputs:
+      task_id: ${{ steps.execute.outputs.task_id }}
+      result_sha256: ${{ steps.execute.outputs.result_sha256 }}
+    steps:
+      - name: Execute registered task and verify durable evidence
+        id: execute
+        env:
+          NPU_PROFILE: ${{ matrix.profile }}
+          NPU_PREREQUISITE: ${{ inputs.prerequisite_task_id }}
+          NPU_PREREQUISITE_SHA256: ${{ inputs.prerequisite_receipt_sha256 }}
+        run: |
+          node /opt/cp11/cp12-client.js "$NPU_PROFILE" \
+            "$NPU_PREREQUISITE" "$NPU_PREREQUISITE_SHA256"
+      - name: Upload required evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: npu-k3s-${{ matrix.name }}-${{ github.run_attempt }}
+          path: cp12-results/
+          if-no-files-found: error
+          retention-days: 14
