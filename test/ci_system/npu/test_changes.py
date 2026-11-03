@@ -84,6 +84,13 @@ class ChangeSelectionTest(unittest.TestCase):
             ("docs/topic.md", False),
             ("tokenspeed-kernel-npu/topic.py", True),
             (".github/workflows/run-ci-task-matrix.yml", True),
+            (".github/workflows/pr-test-ascendnpu-arm.yml", True),
+            (".github/workflows/run-npu-k3s-task-matrix.yml", True),
+            ("python/tokenspeed/runtime/example.py", True),
+            ("tokenspeed-engine/example.cpp", True),
+            ("tokenspeed-scheduler/example.cpp", True),
+            (".github/workflows/cp12-k3s.yml", False),
+            (".github/workflows/cp12-k3s-acceptance.yml", False),
         ):
             with self.subTest(path=path):
                 result = self.select_pr(pr_event(), GitHubFixture([{"filename": path}]))

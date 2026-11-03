@@ -240,7 +240,7 @@ def main() -> None:
         },
         check=True,
     )
-    pip_install(["--no-build-isolation", "-e", str(workspace / "python")], PYPI)
+    pip_install(["--no-build-isolation", "-e", f"{workspace / 'python'}[test]"], PYPI)
     subprocess.run([sys.executable, "-m", "pip", "check"], check=True)
 
 
