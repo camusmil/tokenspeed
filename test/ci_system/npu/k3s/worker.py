@@ -36,12 +36,7 @@ import tarfile
 import time
 from pathlib import Path
 
-STAGES = [
-    "operator-accuracy",
-    "operator-performance",
-    "model-accuracy",
-    "model-performance",
-]
+from task_contract import PROFILES, stage_plan
 
 
 def save(path, value):
@@ -143,6 +138,9 @@ def execute(args):
         "ok": False,
         "started_at": time.time(),
         "management_credentials_absent": True,
+        "prerequisite": (
+            json.loads(env["CI_PREREQUISITE"]) if "CI_PREREQUISITE" in env else None
+        ),
     }
     lock = open("/host-lock/host-all.lock", "rb")
     try:
@@ -155,6 +153,10 @@ def execute(args):
                 if time.monotonic() > deadline:
                     raise TimeoutError("host lock wait exceeded")
                 time.sleep(1)
+        if args.scenario == "model":
+            proof = summary["prerequisite"]
+            if not proof or proof["source_sha"] != args.sha:
+                raise ValueError("model requires a bound successful operator receipt")
         summary["lock_inode"] = os.fstat(lock.fileno()).st_ino
         shutil.copytree("/source", root, symlinks=True)
         actual = subprocess.check_output(
@@ -231,7 +233,7 @@ def execute(args):
             ),
             flush=True,
         )
-        for stage in STAGES:
+        for stage in stage_plan(args.scenario):
             item = {"name": stage, "started_at": time.time(), "status": "failed"}
             summary["stages"].append(item)
             print("CP12_STAGE " + json.dumps(item), flush=True)
@@ -342,7 +344,7 @@ if __name__ == "__main__":
     p.add_argument(
         "--scenario",
         required=True,
-        choices=["normal", "operator-failure", "model-failure", "save-failure"],
+        choices=PROFILES,
     )
     p.add_argument("--image", required=True)
 

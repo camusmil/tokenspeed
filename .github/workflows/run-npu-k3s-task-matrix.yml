@@ -1,0 +1,53 @@
+name: Run NPU K3s Task Matrix
+
+"on":
+  workflow_call:
+    inputs:
+      matrix:
+        required: true
+        type: string
+      prerequisite_task_id:
+        required: true
+        type: string
+      prerequisite_receipt_sha256:
+        required: true
+        type: string
+    outputs:
+      task_id:
+        value: ${{ jobs.test.outputs.task_id }}
+      result_sha256:
+        value: ${{ jobs.test.outputs.result_sha256 }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(inputs.matrix) }}
+    name: ${{ matrix.name }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 125
+    outputs:
+      task_id: ${{ steps.execute.outputs.task_id }}
+      result_sha256: ${{ steps.execute.outputs.result_sha256 }}
+    steps:
+      - name: Execute registered task and verify durable evidence
+        id: execute
+        env:
+          NPU_PROFILE: ${{ matrix.profile }}
+          NPU_PREREQUISITE: ${{ inputs.prerequisite_task_id }}
+          NPU_PREREQUISITE_SHA256: ${{ inputs.prerequisite_receipt_sha256 }}
+        run: |
+          node /opt/cp11/cp12-client.js "$NPU_PROFILE" \
+            "$NPU_PREREQUISITE" "$NPU_PREREQUISITE_SHA256"
+      - name: Upload required evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: npu-k3s-${{ matrix.name }}-${{ github.run_attempt }}
+          path: cp12-results/
+          if-no-files-found: error
+          retention-days: 14

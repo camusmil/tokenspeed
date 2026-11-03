@@ -1,26 +1,34 @@
-name: CP12 controlled NPU chain
+name: Ascend NPU K3s Tests
 
 "on":
+  push:
+    branches: [main]
   pull_request:
-    branches: [codex/cp12-k3s-20261102]
+    branches: [main, codex/cp12-k3s-20261102]
     types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
 
 permissions:
   contents: read
   pull-requests: read
 
 concurrency:
-  group: cp12-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: npu-k3s-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  select:
+  scan:
     if: github.repository == 'camusmil/tokenspeed'
     runs-on: ubuntu-24.04
     outputs:
       should_run: ${{ steps.selection.outputs.should_run }}
+      unit_matrix: ${{ steps.tasks.outputs.unit_matrix }}
+      unit_has_tasks: ${{ steps.tasks.outputs.unit_has_tasks }}
+      model_matrix: ${{ steps.tasks.outputs.model_matrix }}
+      model_has_tasks: ${{ steps.tasks.outputs.model_has_tasks }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - name: Check out event commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -28,7 +36,7 @@ jobs:
         run: |
           python3 -B -m unittest discover -s test/ci_system/npu -p test_changes.py
           python3 -B -m unittest discover -s test/ci_system/npu/k3s -p 'test_*.py'
-      - name: Select the complete registered chain
+      - name: Classify changed paths
         id: selection
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -37,29 +45,67 @@ jobs:
             --manifest test/ci/npu/manifest.json --event-name "$GITHUB_EVENT_NAME" \
             --event-path "$GITHUB_EVENT_PATH" --repository "$GITHUB_REPOSITORY" \
             --github-output "$GITHUB_OUTPUT"
+      - name: Build task matrices
+        id: tasks
+        env:
+          NPU_SELECTED: ${{ steps.selection.outputs.should_run }}
+        run: |
+          python3 -B test/ci_system/npu/k3s/task_contract.py \
+            --selected "$NPU_SELECTED" --github-output "$GITHUB_OUTPUT"
 
-  chain:
-    name: Native chain / ${{ matrix.scenario }}
-    needs: select
-    if: needs.select.outputs.should_run == 'true' && github.event.pull_request.draft == false
+  unit-test:
+    needs: scan
+    if: >-
+      needs.scan.outputs.should_run == 'true' &&
+      needs.scan.outputs.unit_has_tasks == 'true' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     permissions:
       contents: read
       id-token: write
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        scenario: [normal, operator-failure, model-failure, save-failure]
-    runs-on: tokenspeed-pr-arm64
-    timeout-minutes: 125
+    uses: ./.github/workflows/run-npu-k3s-task-matrix.yml
+    with:
+      matrix: ${{ needs.scan.outputs.unit_matrix }}
+      prerequisite_task_id: ''
+      prerequisite_receipt_sha256: ''
+
+  model-test:
+    needs: [scan, unit-test]
+    if: >-
+      !cancelled() && needs.scan.result == 'success' &&
+      needs.scan.outputs.should_run == 'true' &&
+      needs.scan.outputs.model_has_tasks == 'true' &&
+      needs.unit-test.result == 'success' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/run-npu-k3s-task-matrix.yml
+    with:
+      matrix: ${{ needs.scan.outputs.model_matrix }}
+      prerequisite_task_id: ${{ needs.unit-test.outputs.task_id }}
+      prerequisite_receipt_sha256: ${{ needs.unit-test.outputs.result_sha256 }}
+
+  finish:
+    if: always() && github.repository == 'camusmil/tokenspeed'
+    needs: [scan, unit-test, model-test]
+    runs-on: ubuntu-24.04
     steps:
-      - name: Execute registered stages and verify durable evidence
-        run: node /opt/cp11/cp12-client.js '${{ matrix.scenario }}'
-      - name: Upload required evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: cp12-${{ matrix.scenario }}-${{ github.run_attempt }}
-          path: cp12-results/
-          if-no-files-found: error
-          retention-days: 14
+      - name: Finish
+        env:
+          SCAN_RESULT: ${{ needs.scan.result }}
+          NPU_SELECTED: ${{ needs.scan.outputs.should_run }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+          UNIT_TEST_RESULT: ${{ needs.unit-test.result }}
+          MODEL_TEST_RESULT: ${{ needs.model-test.result }}
+        run: |
+          set -euo pipefail
+          test "$SCAN_RESULT" = success
+          if [[ "$NPU_SELECTED" != true || "$IS_DRAFT" = true ]]; then
+            test "$UNIT_TEST_RESULT" = skipped
+            test "$MODEL_TEST_RESULT" = skipped
+            echo 'NPU hardware tasks were not selected.'
+          else
+            test "$UNIT_TEST_RESULT" = success
+            test "$MODEL_TEST_RESULT" = success
+            echo 'NPU operator and model tasks completed successfully.'
+          fi
